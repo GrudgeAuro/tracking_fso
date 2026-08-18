@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(r16ui, binding = 0) readonly uniform uimage2D inImage;
+layout(std430, binding = 1) readonly buffer MinBuffer
+{
+    uint mins[];
+};
+layout(std430, binding = 2) readonly buffer MaxBuffer
+{
+    uint maxs[];
+};
+layout(r16ui, binding = 3) writeonly uniform uimage2D outImage;
+
+layout(push_constant) uniform Params
+{
+    uint width;
+    uint height;
+    uint tileCountX;
+    uint tileSize;
+} p;
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= p.width || y >= p.height)
+        return;
+
+    uint tileX = x / p.tileSize;
+    uint tileY = y / p.tileSize;
+    uint index = tileY * p.tileCountX + tileX;
+
+    uint lo = mins[index];
+    uint hi = maxs[index];
+    uint v = imageLoad(inImage, ivec2(x, y)).r;
+
+    uint outValue;
+    if (hi <= lo)
+    {
+        outValue = v;
+    }
+    else
+    {
+        uint numerator = (v - lo) * 65535u;
+        outValue = numerator / (hi - lo);
+    }
+
+    imageStore(outImage, ivec2(x, y), uvec4(outValue, 0u, 0u, 0u));
+}

@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(r16ui, binding = 0) readonly uniform uimage2D inImage;
+layout(std430, binding = 1) buffer MinBuffer
+{
+    uint mins[];
+};
+layout(std430, binding = 2) buffer MaxBuffer
+{
+    uint maxs[];
+};
+
+layout(push_constant) uniform Params
+{
+    uint width;
+    uint height;
+    uint strideBytes;
+    uint planeOffsetBytes;
+} p;
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= p.width || y >= p.height)
+        return;
+
+    const uint tileSize = 128u;
+    uint tileX = x / tileSize;
+    uint tileY = y / tileSize;
+    uint tileCountX = (p.width + tileSize - 1u) / tileSize;
+    uint index = tileY * tileCountX + tileX;
+
+    uint v = imageLoad(inImage, ivec2(x, y)).r;
+    atomicMin(mins[index], v);
+    atomicMax(maxs[index], v);
+}

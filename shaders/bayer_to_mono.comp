@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer RawBuffer
+{
+    uint rawWords[];
+};
+
+layout(r16ui, binding = 0) uniform uimage2D outMono;
+
+layout(push_constant) uniform Params
+{
+    uint width;
+    uint height;
+    uint strideBytes;
+    uint planeOffsetBytes;
+} p;
+
+uint loadRaw16(uint x, uint y)
+{
+    uint byteOffset = p.planeOffsetBytes + y * p.strideBytes + x * 2u;
+    uint wordIndex = byteOffset >> 2u;
+    uint shift = (byteOffset & 2u) * 8u;
+    return (rawWords[wordIndex] >> shift) & 0xffffu;
+}
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= p.width || y >= p.height)
+        return;
+
+    // Bayer -> monochrome: average the four Bayer samples in a 2x2
+    // neighbourhood. The output remains full resolution; neighbouring
+    // output pixels therefore share samples. All arithmetic is performed
+    // on the original left-aligned 16-bit RAW values.
+    uint x1 = min(x + 1u, p.width - 1u);
+    uint y1 = min(y + 1u, p.height - 1u);
+
+    uint a = loadRaw16(x,  y);
+    uint b = loadRaw16(x1, y);
+    uint c = loadRaw16(x,  y1);
+    uint d = loadRaw16(x1, y1);
+
+    uint mono = (a + b + c + d + 2u) >> 2u;
+    imageStore(outMono, ivec2(x, y), uvec4(mono, 0u, 0u, 0u));
+}
