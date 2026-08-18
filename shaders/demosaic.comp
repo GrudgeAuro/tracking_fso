@@ -1,0 +1,92 @@
+#version 450
+// Integer-only bilinear demosaic to mono luminance for BGGR 12-bit data packed
+// into a 16-bit container (value = sample12 << 4).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Input image: device image imported from DMABUF. We'll read as unsigned short.
+layout(binding = 0, r16ui) readonly uniform uimage2D srcImage;
+// Output image: single-channel 16-bit unsigned where value = (Y12 << 4)
+layout(binding = 1, r16ui) writeonly uniform uimage2D dstImage;
+
+// Fixed-point luminance weights scaled by 4096 (2^12)
+// wR = round(0.2126 * 4096) = 871
+// wG = round(0.7152 * 4096) = 2929
+// wB = round(0.0722 * 4096) = 296
+const uint W_R = 871u;
+const uint W_G = 2929u;
+const uint W_B = 296u;
+const uint FIXED_SCALE = 4096u;
+
+// Helper to clamp to 12-bit
+uint clamp12(uint v) {
+    return (v > 4095u) ? 4095u : v;
+}
+
+uvec2 sizeu() {
+    ivec2 s = imageSize(srcImage);
+    return uvec2(s.x, s.y);
+}
+
+void main() {
+    uvec2 dims = sizeu();
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+
+    if (x >= dims.x || y >= dims.y) return;
+
+    // Read neighbors with edge clamp
+    auto readPixel = [&](int rx, int ry) -> uint {
+        int cx = int(clamp(rx, 0, int(dims.x) - 1));
+        int cy = int(clamp(ry, 0, int(dims.y) - 1));
+        uvec4 v = imageLoad(srcImage, ivec2(cx, cy));
+        return v.x; // raw 16-bit container
+    };
+
+    // Convert to 12-bit samples by shifting right 4
+    // Gather neighbors as 12-bit values in 32-bit accumulators
+    uint c00 = readPixel(int(x)-1, int(y)-1) >> 4;
+    uint c10 = readPixel(int(x),   int(y)-1) >> 4;
+    uint c20 = readPixel(int(x)+1, int(y)-1) >> 4;
+    uint c01 = readPixel(int(x)-1, int(y))   >> 4;
+    uint c11 = readPixel(int(x),   int(y))   >> 4;
+    uint c21 = readPixel(int(x)+1, int(y))   >> 4;
+    uint c02 = readPixel(int(x)-1, int(y)+1) >> 4;
+    uint c12 = readPixel(int(x),   int(y)+1) >> 4;
+    uint c22 = readPixel(int(x)+1, int(y)+1) >> 4;
+
+    // Determine Bayer position (BGGR assumed)
+    bool rowEven = (y % 2u) == 0u;
+    bool colEven = (x % 2u) == 0u;
+
+    uint R, G, B;
+    if (rowEven && colEven) {
+        // Blue pixel
+        B = c11;
+        G = (c10 + c12 + c01 + c21) / 4u;
+        R = (c00 + c02 + c20 + c22) / 4u;
+    } else if (rowEven && !colEven) {
+        // Green (on blue row)
+        G = c11;
+        B = (c10 + c12) / 2u;
+        R = (c01 + c21) / 2u;
+    } else if (!rowEven && colEven) {
+        // Green (on red row)
+        G = c11;
+        B = (c01 + c21) / 2u;
+        R = (c10 + c12) / 2u;
+    } else {
+        // Red pixel
+        R = c11;
+        G = (c10 + c12 + c01 + c21) / 4u;
+        B = (c00 + c02 + c20 + c22) / 4u;
+    }
+
+    // Fixed-point luminance
+    uint Y_fixed = W_R * R + W_G * G + W_B * B;
+    uint Y12 = (Y_fixed + (FIXED_SCALE >> 1)) >> 12; // round
+    Y12 = clamp12(Y12);
+    uint Y16 = (Y12 << 4) & 0xFFFFu;
+
+    imageStore(dstImage, ivec2(x,y), uvec4(Y16,0,0,0));
+}
