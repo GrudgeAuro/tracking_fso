@@ -19,7 +19,16 @@ struct Frame
     std::chrono::steady_clock::time_point timestamp;
     uint64_t sequenceNumber = 0;
 
-    bool empty() const { return image.empty(); }
-    int width() const { return image.cols; }
-    int height() const { return image.rows; }
+    // Optional zero-copy DMABUF path: if dmabufFd != -1, the frame carries
+    // a duplicated dmabuf file descriptor that the Vulkan path can import
+    // directly. When present, `image` will be empty and the display should
+    // use the GPU path instead of the CPU upload path. The import helper
+    // consumes/closes the fd.
+    int dmabufFd = -1;
+    uint32_t dmabufWidth = 0;
+    uint32_t dmabufHeight = 0;
+
+    bool empty() const { return image.empty() && dmabufFd == -1; }
+    int width() const { return image.empty() ? static_cast<int>(dmabufWidth) : image.cols; }
+    int height() const { return image.empty() ? static_cast<int>(dmabufHeight) : image.rows; }
 };
