@@ -26,4 +26,15 @@ VkImageView createImageView2D(VkDevice device, VkImage image, VkFormat format, V
 // creates a VkShaderModule from it.
 VkShaderModule loadShaderModule(VkDevice device, const std::string& spirvPath);
 
+// Create a VkImage backed by imported dmabuf FD. The function imports the
+// given fd as device memory and binds it to an image with the provided
+// parameters. On success returns true and fills outImage/outMemory.
+//
+// NOTE: This assumes the caller has verified supportsDmabufImport() and that
+// the fd is a single-plane dmabuf suitable for the requested format/extent.
+bool importImageFromDmabuf(VkDevice device, VkPhysicalDevice physDevice,
+                           int dmabufFd, uint32_t width, uint32_t height,
+                           VkFormat format, VkImageUsageFlags usage,
+                           VkImage& outImage, VkDeviceMemory& outMemory);
+
 } // namespace VkUtils
