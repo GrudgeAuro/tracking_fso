@@ -92,23 +92,29 @@ private:
     VkBuffer maxBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory maxMemory_ = VK_NULL_HANDLE;
 
-    VkDescriptorSetLayout rawLayout_ = VK_NULL_HANDLE;
+    // Two raw descriptor/pipeline variants: buffer-backed and image-backed.
+    VkDescriptorSetLayout rawBufferLayout_ = VK_NULL_HANDLE; // binding 0 = storage buffer, 1 = mono image
+    VkDescriptorSetLayout rawImageLayout_ = VK_NULL_HANDLE;  // binding 0 = storage image, 1 = mono image
+
     VkDescriptorSetLayout imageToImageLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout minMaxLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout contrastLayout_ = VK_NULL_HANDLE;
 
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet rawSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet rawBufferSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet rawImageSet_ = VK_NULL_HANDLE;
     VkDescriptorSet medianSet_ = VK_NULL_HANDLE;
     VkDescriptorSet minMaxSet_ = VK_NULL_HANDLE;
     VkDescriptorSet contrastSet_ = VK_NULL_HANDLE;
 
-    VkPipelineLayout rawPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout rawBufferPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout rawImagePipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout medianPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout minMaxPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout contrastPipelineLayout_ = VK_NULL_HANDLE;
 
-    VkPipeline rawPipeline_ = VK_NULL_HANDLE;
+    VkPipeline rawBufferPipeline_ = VK_NULL_HANDLE;
+    VkPipeline rawImagePipeline_ = VK_NULL_HANDLE;
     VkPipeline medianPipeline_ = VK_NULL_HANDLE;
     VkPipeline minMaxPipeline_ = VK_NULL_HANDLE;
     VkPipeline contrastPipeline_ = VK_NULL_HANDLE;
