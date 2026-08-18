@@ -7,7 +7,7 @@ layout(std430, binding = 0) readonly buffer RawBuffer
     uint rawWords[];
 };
 
-layout(r16ui, binding = 0) uniform uimage2D outMono;
+layout(r16ui, binding = 1) uniform uimage2D outMono;
 
 layout(push_constant) uniform Params
 {
