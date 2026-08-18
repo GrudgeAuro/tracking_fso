@@ -60,19 +60,26 @@ bool RaspberryPiCameraSource::open(int width, int height, int fps)
         return false;
     }
 
-    config_ = camera_->generateConfiguration({ StreamRole::VideoRecording });
+    // Try RAW first; fall back to VideoRecording if unavailable.
+    config_ = camera_->generateConfiguration({ StreamRole::Raw });
     if (!config_ || config_->empty())
     {
-        std::cerr << "[RaspberryPiCameraSource] Failed to generate configuration\n";
-        return false;
+        std::cerr << "[RaspberryPiCameraSource] RAW stream role not available; falling back to VideoRecording (Y plane)\n";
+        config_ = camera_->generateConfiguration({ StreamRole::VideoRecording });
+        if (!config_ || config_->empty())
+        {
+            std::cerr << "[RaspberryPiCameraSource] Failed to generate configuration\n";
+            return false;
+        }
     }
 
     StreamConfiguration& streamConfig = config_->at(0);
     streamConfig.size.width = width;
     streamConfig.size.height = height;
-    // Planar YUV 4:2:0, matching the ISP's native output -- plane 0 is Y,
-    // full resolution, no conversion required to isolate luma.
-    streamConfig.pixelFormat = formats::YUV420;
+
+    // Prefer RAW SBGGR12; if not available, libcamera will adjust to an
+    // available format (e.g., YUV420) during validate()/configure().
+    streamConfig.pixelFormat = formats::SBGGR12;
 
     CameraConfiguration::Status status = config_->validate();
     if (status == CameraConfiguration::Invalid)
@@ -95,7 +102,7 @@ bool RaspberryPiCameraSource::open(int width, int height, int fps)
 
     width_ = static_cast<int>(streamConfig.size.width);
     height_ = static_cast<int>(streamConfig.size.height);
-    yStride_ = streamConfig.stride; // row stride of plane 0 (Y), in bytes
+    yStride_ = streamConfig.stride; // row stride of plane 0, in bytes
     stream_ = streamConfig.stream();
 
     allocator_ = std::make_unique<FrameBufferAllocator>(camera_);
@@ -209,37 +216,83 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
 
     if (yPlane.length >= bytesIf16 && yStride_ >= static_cast<unsigned int>(width_ * 2))
     {
-        // Likely 16-bit RAW packed into 2 bytes per pixel.
-        const int elemBytes = 2;
-        const size_t rowBytesNeeded = static_cast<size_t>(width_) * elemBytes;
-
+        // RAW 16-bit data path: interpret as CV_16UC1 raw Bayer (BGGR) and demosaic to 16-bit mono
+        const size_t rowBytesNeeded = static_cast<size_t>(width_) * 2;
+        cv::Mat raw16;
         if (static_cast<size_t>(yStride_) >= rowBytesNeeded) {
-            cv::Mat wrapped(height_, width_, CV_16UC1, yData, yStride_);
-            outFrame.image = wrapped.clone();
+            raw16 = cv::Mat(height_, width_, CV_16UC1, yData, yStride_).clone();
         } else {
-            cv::Mat tmp(height_, width_, CV_16UC1);
-            for (int y = 0; y < height_; ++y) {
-                uint8_t* srcRow = reinterpret_cast<uint8_t*>(yData) + (size_t)y * yStride_;
-                void* dstRow = tmp.ptr(y);
-                memcpy(dstRow, srcRow, rowBytesNeeded);
+            raw16 = cv::Mat(height_, width_, CV_16UC1);
+            for (int r = 0; r < height_; ++r)
+            {
+                memcpy(raw16.ptr(r), yData + (size_t)r * yStride_, rowBytesNeeded);
             }
-            outFrame.image = tmp;
         }
 
+        // Convert raw16 (16-bit container with left-aligned 12-bit samples) to 12-bit samples
+        // by shifting right 4 bits, then perform a simple demosaic to monochrome.
+        cv::Mat raw12(height_, width_, CV_16UC1);
+        for (int r = 0; r < height_; ++r)
+        {
+            uint16_t* s = raw16.ptr<uint16_t>(r);
+            uint16_t* d = raw12.ptr<uint16_t>(r);
+            for (int c = 0; c < width_; ++c)
+                d[c] = static_cast<uint16_t>(s[c] >> 4);
+        }
+
+        cv::Mat mono16(height_, width_, CV_16UC1);
+        auto get = [&](int rr, int cc) -> uint16_t {
+            int rclamped = std::min(std::max(rr, 0), height_ - 1);
+            int cclamped = std::min(std::max(cc, 0), width_ - 1);
+            return raw12.ptr<uint16_t>(rclamped)[cclamped];
+        };
+
+        for (int r = 0; r < height_; ++r)
+        {
+            uint16_t* dst = mono16.ptr<uint16_t>(r);
+            for (int c = 0; c < width_; ++c)
+            {
+                bool rowEven = (r % 2) == 0;
+                bool colEven = (c % 2) == 0;
+                float R, G, B;
+                if (rowEven && colEven) {
+                    B = get(r, c);
+                    G = (get(r, c-1) + get(r, c+1) + get(r-1, c) + get(r+1, c)) / 4.0f;
+                    R = (get(r-1, c-1) + get(r-1, c+1) + get(r+1, c-1) + get(r+1, c+1)) / 4.0f;
+                } else if (rowEven && !colEven) {
+                    G = get(r, c);
+                    B = (get(r, c-1) + get(r, c+1)) / 2.0f;
+                    R = (get(r-1, c) + get(r+1, c)) / 2.0f;
+                } else if (!rowEven && colEven) {
+                    G = get(r, c);
+                    B = (get(r-1, c) + get(r+1, c)) / 2.0f;
+                    R = (get(r, c-1) + get(r, c+1)) / 2.0f;
+                } else {
+                    R = get(r, c);
+                    G = (get(r, c-1) + get(r, c+1) + get(r-1, c) + get(r+1, c)) / 4.0f;
+                    B = (get(r-1, c-1) + get(r-1, c+1) + get(r+1, c-1) + get(r+1, c+1)) / 4.0f;
+                }
+
+                float y = 0.2126f * R + 0.7152f * G + 0.0722f * B;
+                if (y < 0.0f) y = 0.0f;
+                if (y > 4095.0f) y = 4095.0f;
+                uint16_t y16 = static_cast<uint16_t>(std::round(y)) << 4;
+                dst[c] = y16;
+            }
+        }
+
+        outFrame.image = mono16;
         munmap(base, mapLength);
+        std::cerr << "[mapYPlane] used RAW demosaic -> CV_16UC1 mono\n";
         return true;
     }
 
-    // Otherwise assume an 8-bit Y plane: wrap as CV_8UC1 then promote to CV_16UC1
+    // Fallback: 8-bit Y plane path — wrap, clone, promote to 16-bit full range
     cv::Mat wrapped8(height_, width_, CV_8UC1, yData, yStride_);
-    cv::Mat tmp8 = wrapped8.clone(); // make contiguous
-
-    // Promote to 16-bit, scale 0..255 -> 0..65535 (use 257 to map 255->65535 approx)
+    cv::Mat contig8 = wrapped8.clone();
     cv::Mat out16;
-    tmp8.convertTo(out16, CV_16U, 257.0);
+    contig8.convertTo(out16, CV_16U, 257.0); // map 0..255 -> 0..65535
     outFrame.image = out16;
-
-    std::cerr << "[RaspberryPiCameraSource] Converted 8-bit Y plane to CV_16UC1 for processing\n";
 
     munmap(base, mapLength);
     return true;
@@ -295,4 +348,4 @@ bool RaspberryPiCameraSource::isOpen() const { return open_; }
 int RaspberryPiCameraSource::width() const { return width_; }
 int RaspberryPiCameraSource::height() const { return height_; }
 double RaspberryPiCameraSource::fps() const { return fps_; }
-std::string RaspberryPiCameraSource::name() const { return "RaspberryPiCameraSource (libcamera, Y-plane)"; }
+std::string RaspberryPiCameraSource::name() const { return "RaspberryPiCameraSource (libcamera, RAW)"; }
