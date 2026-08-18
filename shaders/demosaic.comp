@@ -23,25 +23,21 @@ uint clamp12(uint v) {
     return (v > 4095u) ? 4095u : v;
 }
 
-uvec2 sizeu() {
-    ivec2 s = imageSize(srcImage);
-    return uvec2(s.x, s.y);
+// Helper to read pixel with edge clamp
+uint readPixel(int rx, int ry) {
+    ivec2 dims = imageSize(srcImage);
+    int cx = clamp(rx, 0, dims.x - 1);
+    int cy = clamp(ry, 0, dims.y - 1);
+    uvec4 v = imageLoad(srcImage, ivec2(cx, cy));
+    return v.x; // raw 16-bit container
 }
 
 void main() {
-    uvec2 dims = sizeu();
+    ivec2 dims = imageSize(srcImage);
     uint x = gl_GlobalInvocationID.x;
     uint y = gl_GlobalInvocationID.y;
 
-    if (x >= dims.x || y >= dims.y) return;
-
-    // Read neighbors with edge clamp
-    auto readPixel = [&](int rx, int ry) -> uint {
-        int cx = int(clamp(rx, 0, int(dims.x) - 1));
-        int cy = int(clamp(ry, 0, int(dims.y) - 1));
-        uvec4 v = imageLoad(srcImage, ivec2(cx, cy));
-        return v.x; // raw 16-bit container
-    };
+    if (x >= uint(dims.x) || y >= uint(dims.y)) return;
 
     // Convert to 12-bit samples by shifting right 4
     // Gather neighbors as 12-bit values in 32-bit accumulators
