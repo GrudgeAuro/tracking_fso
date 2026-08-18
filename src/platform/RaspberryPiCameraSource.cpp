@@ -203,10 +203,43 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
                    << " x height " << height_ << "). Verify against this libcamera version.\n";
     }
 
-    // Wrap with the real row stride, then clone into a tightly packed
-    // buffer so the mmap can be released immediately.
-    cv::Mat wrapped(height_, width_, CV_8UC1, yData, yStride_);
-    outFrame.image = wrapped.clone();
+    // Detect whether the plane appears to be 8-bit (Y) or 16-bit RAW.
+    const size_t bytesIf8 = static_cast<size_t>(yStride_) * static_cast<size_t>(height_);
+    const size_t bytesIf16 = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 2u;
+
+    if (yPlane.length >= bytesIf16 && yStride_ >= static_cast<unsigned int>(width_ * 2))
+    {
+        // Likely 16-bit RAW packed into 2 bytes per pixel.
+        const int elemBytes = 2;
+        const size_t rowBytesNeeded = static_cast<size_t>(width_) * elemBytes;
+
+        if (static_cast<size_t>(yStride_) >= rowBytesNeeded) {
+            cv::Mat wrapped(height_, width_, CV_16UC1, yData, yStride_);
+            outFrame.image = wrapped.clone();
+        } else {
+            cv::Mat tmp(height_, width_, CV_16UC1);
+            for (int y = 0; y < height_; ++y) {
+                uint8_t* srcRow = reinterpret_cast<uint8_t*>(yData) + (size_t)y * yStride_;
+                void* dstRow = tmp.ptr(y);
+                memcpy(dstRow, srcRow, rowBytesNeeded);
+            }
+            outFrame.image = tmp;
+        }
+
+        munmap(base, mapLength);
+        return true;
+    }
+
+    // Otherwise assume an 8-bit Y plane: wrap as CV_8UC1 then promote to CV_16UC1
+    cv::Mat wrapped8(height_, width_, CV_8UC1, yData, yStride_);
+    cv::Mat tmp8 = wrapped8.clone(); // make contiguous
+
+    // Promote to 16-bit, scale 0..255 -> 0..65535 (use 257 to map 255->65535 approx)
+    cv::Mat out16;
+    tmp8.convertTo(out16, CV_16U, 257.0);
+    outFrame.image = out16;
+
+    std::cerr << "[RaspberryPiCameraSource] Converted 8-bit Y plane to CV_16UC1 for processing\n";
 
     munmap(base, mapLength);
     return true;
