@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 #include <vector>
+#include <string>
 
 struct GLFWwindow;
 
@@ -78,6 +79,10 @@ public:
         return cmdEndRendering_;
     }
 
+    // Probe whether the current physical device exposes the Vulkan extensions
+    // required for zero-copy DMABUF import (used by the GPU demosaic path).
+    bool supportsDmabufImport() const { return dmabufImportSupported_; }
+
 private:
     bool createInstance(bool enableValidation);
     bool createSurface();
@@ -150,4 +155,7 @@ private:
     PFN_vkCmdEndRendering cmdEndRendering_ = nullptr;
 
     bool validationEnabled_ = false;
+
+    // Whether the physical device appears to support dmabuf import for images.
+    bool dmabufImportSupported_ = false;
 };
