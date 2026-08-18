@@ -6,10 +6,11 @@
 
 struct GLFWwindow;
 
-// Fundamental stage: uploads each Frame's Y plane to a single-channel
-// (R8_UNORM) GPU texture and draws it full-screen via Vulkan. No color
-// processing -- what you see is exactly the luma the PRBS algorithm will
-// operate on.
+// Fundamental stage: uploads each Frame's luma channel (16-bit R16_UINT) to a
+// single-channel GPU texture and draws it full-screen via Vulkan. The GPU
+// fragment shader maps the 16-bit mono values to 8-bit for display, but the
+// underlying Frame passed to the pipeline remains CV_16UC1 so signal
+// processing can operate on the full 16-bit luma values.
 //
 // This owns the VulkanContext (instance/device/swapchain) since it's the
 // only stage today. When the PRBS correlator stage is added, promote
@@ -44,7 +45,7 @@ private:
 
     int width_ = 0, height_ = 0;
 
-    // Y-channel texture (sampled by the fragment shader) + its staging buffer.
+    // Luma texture (R16_UINT) sampled by the fragment shader + its staging buffer.
     VkImage textureImage_ = VK_NULL_HANDLE;
     VkDeviceMemory textureMemory_ = VK_NULL_HANDLE;
     VkImageView textureView_ = VK_NULL_HANDLE;
