@@ -189,6 +189,32 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
 {
     const FrameBuffer::Plane& yPlane = buffer->planes()[0];
 
+    // Detect whether the plane appears to be 8-bit (Y) or 16-bit RAW.
+    const size_t bytesIf8 = static_cast<size_t>(yStride_) * static_cast<size_t>(height_);
+    const size_t bytesIf16 = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 2u;
+
+    if (yPlane.length >= bytesIf16 && yStride_ >= static_cast<unsigned int>(width_ * 2))
+    {
+        // RAW 16-bit data path: hand the dmabuf fd to the GPU demosaic stage
+        // for zero-copy import and GPU-based demosaic. We dup() the fd to
+        // avoid interfering with libcamera's ownership.
+        int dupFd = dup(yPlane.fd.get());
+        if (dupFd < 0)
+        {
+            std::cerr << "[RaspberryPiCameraSource] dup() failed for RAW dmabuf fd\n";
+            return false;
+        }
+
+        outFrame.dmabufFd = dupFd;
+        outFrame.dmabufWidth = width_;
+        outFrame.dmabufHeight = height_;
+        outFrame.image = cv::Mat(); // empty; GPU path will process the dmabuf
+
+        std::cerr << "[mapYPlane] handing duped fd=" << dupFd << " to VulkanDemosaic\n";
+        return true;
+    }
+
+    // Fallback: 8-bit Y plane path — wrap, clone, promote to 16-bit full range
     // Map from offset 0 through (offset + length): planes can share a
     // single dmabuf fd at different offsets, so this is the only mapping
     // that's correct regardless of how the ISP packed Y/U/V for this format.
@@ -202,92 +228,6 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
 
     uint8_t* yData = static_cast<uint8_t*>(base) + yPlane.offset;
 
-    const size_t expected = static_cast<size_t>(yStride_) * static_cast<size_t>(height_);
-    if (yPlane.length < expected)
-    {
-        std::cerr << "[RaspberryPiCameraSource] WARNING: Y plane length " << yPlane.length
-                   << " < expected " << expected << " (stride " << yStride_
-                   << " x height " << height_ << "). Verify against this libcamera version.\n";
-    }
-
-    // Detect whether the plane appears to be 8-bit (Y) or 16-bit RAW.
-    const size_t bytesIf8 = static_cast<size_t>(yStride_) * static_cast<size_t>(height_);
-    const size_t bytesIf16 = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 2u;
-
-    if (yPlane.length >= bytesIf16 && yStride_ >= static_cast<unsigned int>(width_ * 2))
-    {
-        // RAW 16-bit data path: interpret as CV_16UC1 raw Bayer (BGGR) and demosaic to 16-bit mono
-        const size_t rowBytesNeeded = static_cast<size_t>(width_) * 2;
-        cv::Mat raw16;
-        if (static_cast<size_t>(yStride_) >= rowBytesNeeded) {
-            raw16 = cv::Mat(height_, width_, CV_16UC1, yData, yStride_).clone();
-        } else {
-            raw16 = cv::Mat(height_, width_, CV_16UC1);
-            for (int r = 0; r < height_; ++r)
-            {
-                memcpy(raw16.ptr(r), yData + (size_t)r * yStride_, rowBytesNeeded);
-            }
-        }
-
-        // Convert raw16 (16-bit container with left-aligned 12-bit samples) to 12-bit samples
-        // by shifting right 4 bits, then perform a simple demosaic to monochrome.
-        cv::Mat raw12(height_, width_, CV_16UC1);
-        for (int r = 0; r < height_; ++r)
-        {
-            uint16_t* s = raw16.ptr<uint16_t>(r);
-            uint16_t* d = raw12.ptr<uint16_t>(r);
-            for (int c = 0; c < width_; ++c)
-                d[c] = static_cast<uint16_t>(s[c] >> 4);
-        }
-
-        cv::Mat mono16(height_, width_, CV_16UC1);
-        auto get = [&](int rr, int cc) -> uint16_t {
-            int rclamped = std::min(std::max(rr, 0), height_ - 1);
-            int cclamped = std::min(std::max(cc, 0), width_ - 1);
-            return raw12.ptr<uint16_t>(rclamped)[cclamped];
-        };
-
-        for (int r = 0; r < height_; ++r)
-        {
-            uint16_t* dst = mono16.ptr<uint16_t>(r);
-            for (int c = 0; c < width_; ++c)
-            {
-                bool rowEven = (r % 2) == 0;
-                bool colEven = (c % 2) == 0;
-                float R, G, B;
-                if (rowEven && colEven) {
-                    B = get(r, c);
-                    G = (get(r, c-1) + get(r, c+1) + get(r-1, c) + get(r+1, c)) / 4.0f;
-                    R = (get(r-1, c-1) + get(r-1, c+1) + get(r+1, c-1) + get(r+1, c+1)) / 4.0f;
-                } else if (rowEven && !colEven) {
-                    G = get(r, c);
-                    B = (get(r, c-1) + get(r, c+1)) / 2.0f;
-                    R = (get(r-1, c) + get(r+1, c)) / 2.0f;
-                } else if (!rowEven && colEven) {
-                    G = get(r, c);
-                    B = (get(r-1, c) + get(r+1, c)) / 2.0f;
-                    R = (get(r, c-1) + get(r, c+1)) / 2.0f;
-                } else {
-                    R = get(r, c);
-                    G = (get(r, c-1) + get(r, c+1) + get(r-1, c) + get(r+1, c)) / 4.0f;
-                    B = (get(r-1, c-1) + get(r-1, c+1) + get(r+1, c-1) + get(r+1, c+1)) / 4.0f;
-                }
-
-                float y = 0.2126f * R + 0.7152f * G + 0.0722f * B;
-                if (y < 0.0f) y = 0.0f;
-                if (y > 4095.0f) y = 4095.0f;
-                uint16_t y16 = static_cast<uint16_t>(std::round(y)) << 4;
-                dst[c] = y16;
-            }
-        }
-
-        outFrame.image = mono16;
-        munmap(base, mapLength);
-        std::cerr << "[mapYPlane] used RAW demosaic -> CV_16UC1 mono\n";
-        return true;
-    }
-
-    // Fallback: 8-bit Y plane path — wrap, clone, promote to 16-bit full range
     cv::Mat wrapped8(height_, width_, CV_8UC1, yData, yStride_);
     cv::Mat contig8 = wrapped8.clone();
     cv::Mat out16;
@@ -295,6 +235,7 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
     outFrame.image = out16;
 
     munmap(base, mapLength);
+    std::cerr << "[mapYPlane] used 8-bit Y fallback -> CV_16UC1 mono\n";
     return true;
 }
 
@@ -348,4 +289,4 @@ bool RaspberryPiCameraSource::isOpen() const { return open_; }
 int RaspberryPiCameraSource::width() const { return width_; }
 int RaspberryPiCameraSource::height() const { return height_; }
 double RaspberryPiCameraSource::fps() const { return fps_; }
-std::string RaspberryPiCameraSource::name() const { return "RaspberryPiCameraSource (libcamera, RAW)"; }
+std::string RaspberryPiCameraSource::name() const { return "RaspberryPiCameraSource (libcamera, zero-copy GPU demosaic)"; }
