@@ -97,16 +97,21 @@ bool VulkanRawProcessor::createMinMaxBuffer()
 
 bool VulkanRawProcessor::createDescriptorLayouts()
 {
-    // RAW SSBO.
-    VkDescriptorSetLayoutBinding rawBinding{};
-    rawBinding.binding = 0;
-    rawBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    rawBinding.descriptorCount = 1;
-    rawBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    // RAW layout: RAW buffer (binding 0) + output image (binding 1).
+    VkDescriptorSetLayoutBinding rawBindings[2]{};
+    rawBindings[0].binding = 0;
+    rawBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    rawBindings[0].descriptorCount = 1;
+    rawBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    rawBindings[1].binding = 1;
+    rawBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    rawBindings[1].descriptorCount = 1;
+    rawBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo ci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    ci.bindingCount = 1;
-    ci.pBindings = &rawBinding;
+    ci.bindingCount = 2;
+    ci.pBindings = rawBindings;
     if (vkCreateDescriptorSetLayout(device_, &ci, nullptr, &rawLayout_) != VK_SUCCESS)
         return false;
 
@@ -259,21 +264,35 @@ bool VulkanRawProcessor::createPipelines()
     VkDescriptorBufferInfo minInfo{ minBuffer_, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo maxInfo{ maxBuffer_, 0, VK_WHOLE_SIZE };
 
+    // Write mono output image to raw set (binding 1). RAW buffer (binding 0) will be written per-frame.
+    VkWriteDescriptorSet rawWrites[1]{};
+    rawWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    rawWrites[0].dstSet = rawSet_;
+    rawWrites[0].dstBinding = 1;
+    rawWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    rawWrites[0].descriptorCount = 1;
+    rawWrites[0].pImageInfo = &monoInfo;
+    vkUpdateDescriptorSets(device_, 1, rawWrites, 0, nullptr);
+
+    VkDescriptorImageInfo mmImageInfo = medianInfo;
+    VkDescriptorBufferInfo minBufInfo = minInfo;
+    VkDescriptorBufferInfo maxBufInfo = maxInfo;
+
     VkWriteDescriptorSet mmWrites[3]{};
     mmWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
     mmWrites[0].dstSet = minMaxSet_;
     mmWrites[0].dstBinding = 0;
     mmWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     mmWrites[0].descriptorCount = 1;
-    mmWrites[0].pImageInfo = &medianInfo;
+    mmWrites[0].pImageInfo = &mmImageInfo;
     mmWrites[1] = mmWrites[0];
     mmWrites[1].dstBinding = 1;
     mmWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     mmWrites[1].pImageInfo = nullptr;
-    mmWrites[1].pBufferInfo = &minInfo;
+    mmWrites[1].pBufferInfo = &minBufInfo;
     mmWrites[2] = mmWrites[1];
     mmWrites[2].dstBinding = 2;
-    mmWrites[2].pBufferInfo = &maxInfo;
+    mmWrites[2].pBufferInfo = &maxBufInfo;
     vkUpdateDescriptorSets(device_, 3, mmWrites, 0, nullptr);
 
     VkDescriptorImageInfo contrastInputs[2] = { medianInfo, contrastInfo };
@@ -332,8 +351,8 @@ bool VulkanRawProcessor::importDmaBuf(const Frame& frame, ImportedBuffer& out)
     VkMemoryFdPropertiesKHR fdProps{
         VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR
     };
-    
-    
+
+
     PFN_vkGetMemoryFdPropertiesKHR pfnGetMemoryFdPropertiesKHR =
     reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
         vkGetDeviceProcAddr(device_, "vkGetMemoryFdPropertiesKHR"));
