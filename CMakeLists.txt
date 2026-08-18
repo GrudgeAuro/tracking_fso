@@ -23,6 +23,7 @@ file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 set(SHADER_SOURCES
     ${SHADER_SRC_DIR}/fullscreen.vert
     ${SHADER_SRC_DIR}/y_channel.frag
+    ${SHADER_SRC_DIR}/demosaic.comp
 )
 set(SHADER_SPIRV_OUTPUTS "")
 foreach(SHADER ${SHADER_SOURCES})
@@ -45,6 +46,7 @@ add_executable(prbs_vision
     src/gpu/VulkanContext.cpp
     src/gpu/VulkanDisplayStage.cpp
     src/gpu/VkUtils.cpp
+    src/gpu/VulkanDemosaicStage.cpp
 )
 add_dependencies(prbs_vision shaders)
 
