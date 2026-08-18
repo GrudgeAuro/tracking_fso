@@ -7,7 +7,11 @@
 
 namespace
 {
-constexpr VkFormat kYChannelFormat = VK_FORMAT_R8_UNORM;
+// Use a 16-bit normalized format for display sampling. The CPU Frame.image
+// remains CV_16UC1 and GPU processing pipelines use R16_UINT for integer
+// compute shaders; the display texture is R16_UNORM so the fragment shader
+// gets normalized floats for convenient mapping to 8-bit preview.
+constexpr VkFormat kYChannelFormat = VK_FORMAT_R16_UNORM;
 }
 
 VulkanDisplayStage::VulkanDisplayStage(const char* windowTitle, bool enableValidation)
@@ -82,7 +86,8 @@ bool VulkanDisplayStage::createTextureResources()
         return false;
     }
 
-    const VkDeviceSize stagingSize = static_cast<VkDeviceSize>(width_) * static_cast<VkDeviceSize>(height_);
+    // Staging buffer holds 2 bytes per pixel for CV_16UC1 -> R16 image.
+    const VkDeviceSize stagingSize = static_cast<VkDeviceSize>(width_) * static_cast<VkDeviceSize>(height_) * 2ull;
     if (!VkUtils::createBuffer(device, phys, stagingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                 stagingBuffer_, stagingMemory_))
@@ -267,15 +272,16 @@ void VulkanDisplayStage::uploadFrame(
         return;
     }
 
-    // ------------------------------------------------------------
-    // Copy CPU frame into mapped staging buffer.
-    // ------------------------------------------------------------
-
-    const size_t rowBytes =
-        static_cast<size_t>(width_);
+    // Expect CV_16UC1 with 2 bytes per pixel
+    const size_t rowBytes = static_cast<size_t>(width_) * 2;
 
     uint8_t* dst =
         static_cast<uint8_t*>(stagingMapped_);
+
+    if (frame.image.type() != CV_16UC1) {
+        std::cerr << "[uploadFrame] ERROR: expected CV_16UC1, got type=" << frame.image.type() << "\n";
+        return;
+    }
 
     if (frame.image.isContinuous() &&
         static_cast<size_t>(frame.image.step) == rowBytes)
