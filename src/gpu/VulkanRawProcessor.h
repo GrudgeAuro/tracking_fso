@@ -28,7 +28,11 @@ public:
 private:
     struct ImportedBuffer
     {
+        // Support both buffer-backed and image-backed imports so we can
+        // experiment with either path during debugging.
         VkBuffer buffer = VK_NULL_HANDLE;
+        VkImage image = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkDeviceSize size = 0;
     };
@@ -39,8 +43,13 @@ private:
     bool createDescriptorPool();
     bool createPipelines();
 
+    // Buffer-backed import (legacy / fallback).
     bool getImportedBuffer(const Frame& frame, VkBuffer& outBuffer);
     bool importDmaBuf(const Frame& frame, ImportedBuffer& out);
+
+    // Image-backed import (preferred on platforms that support it).
+    bool getImportedImage(const Frame& frame, VkImageView& outView);
+    bool importDmaBufAsImage(const Frame& frame, ImportedBuffer& out);
 
     void destroyImportedBuffers();
     void destroyImages();
