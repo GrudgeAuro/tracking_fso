@@ -1,5 +1,6 @@
 #include "VulkanDisplayStage.h"
 #include "VkUtils.h"
+#include "VulkanDemosaicStage.h"
 
 #include <GLFW/glfw3.h>
 #include <iostream>
@@ -7,11 +8,10 @@
 
 namespace
 {
-// Use a 16-bit normalized format for display sampling. The CPU Frame.image
-// remains CV_16UC1 and GPU processing pipelines use R16_UINT for integer
-// compute shaders; the display texture is R16_UNORM so the fragment shader
-// gets normalized floats for convenient mapping to 8-bit preview.
-constexpr VkFormat kYChannelFormat = VK_FORMAT_R16_UNORM;
+// Use a 16-bit unsigned integer format for display sampling so the fragment
+// shader can sample the GPU-produced R16_UINT image directly as unsigned
+// integers and convert to normalized floats for preview.
+constexpr VkFormat kYChannelFormat = VK_FORMAT_R16_UINT;
 }
 
 VulkanDisplayStage::VulkanDisplayStage(const char* windowTitle, bool enableValidation)
@@ -50,6 +50,11 @@ bool VulkanDisplayStage::init(int width, int height)
 
     if (!ctx_.init(window_, enableValidation_))
         return false;
+
+    // Create the GPU demosaic stage now that the VulkanContext exists. If the
+    // platform supports dmabuf import the stage will be used; otherwise it
+    // will not be invoked.
+    demosaicStage_ = new VulkanDemosaicStage(ctx_.device(), ctx_.physicalDevice(), ctx_.commandPool(), ctx_.queue());
 
     if (!createTextureResources()) return false;
     if (!createDescriptors()) return false;
@@ -137,8 +142,9 @@ bool VulkanDisplayStage::createDescriptors()
         return false;
     }
 
-    // Texture never changes identity (only its contents, every frame), so
-    // the descriptor is written once here rather than per-frame.
+    // Initially point descriptor at the CPU-backed texture image. When the
+    // GPU demosaic path is used we update the descriptor to point at the
+    // VulkanDemosaicStage's output image view.
     VkDescriptorImageInfo imageInfo{};
     imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     imageInfo.imageView = textureView_;
@@ -446,6 +452,20 @@ void VulkanDisplayStage::uploadFrame(
     cmdPipelineBarrier2(cmd, &dep2);
 
     textureLayoutIsShaderRead_ = true;
+
+    // Ensure the descriptor points at the CPU-backed texture for subsequent frames
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageInfo.imageView = textureView_;
+    imageInfo.sampler = sampler_;
+
+    VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    write.dstSet = descriptorSet_;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &imageInfo;
+    vkUpdateDescriptorSets(ctx_.device(), 1, &write, 0, nullptr);
 }
 
 
@@ -470,8 +490,38 @@ bool VulkanDisplayStage::process(const Frame& frame)
         return shouldContinue();
     }
 
-    // Upload camera frame into texture
-    uploadFrame(cmd, frame);
+    // If the frame carries a dmabuf fd, use the zero-copy GPU demosaic path.
+    if (frame.dmabufFd != -1 && demosaicStage_)
+    {
+        std::cerr << "[mapYPlane] handing duped fd to VulkanDemosaic\n";
+        if (!demosaicStage_->processDmabuf(frame.dmabufFd, frame.dmabufWidth, frame.dmabufHeight))
+        {
+            std::cerr << "[VulkanDisplayStage] VulkanDemosaicStage failed\n";
+            return false; // per your instruction: no fallback
+        }
+
+        // Update descriptor to point at the demosaic stage's output image view.
+        VkDescriptorImageInfo imageInfo{};
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageInfo.imageView = demosaicStage_->outputImageView();
+        imageInfo.sampler = sampler_;
+
+        VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        write.dstSet = descriptorSet_;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &imageInfo;
+        vkUpdateDescriptorSets(ctx_.device(), 1, &write, 0, nullptr);
+
+        // Mark texture as ready for shader read.
+        textureLayoutIsShaderRead_ = true;
+    }
+    else
+    {
+        // Upload camera frame into texture (CPU path)
+        uploadFrame(cmd, frame);
+    }
 
     // Get Vulkan KHR function pointers
     auto cmdPipelineBarrier2 = ctx_.cmdPipelineBarrier2();
@@ -696,6 +746,11 @@ void VulkanDisplayStage::shutdown()
     if (descriptorSetLayout_) vkDestroyDescriptorSetLayout(device, descriptorSetLayout_, nullptr);
 
     destroyTextureResources();
+
+    if (demosaicStage_) {
+        delete demosaicStage_;
+        demosaicStage_ = nullptr;
+    }
 
     ctx_.shutdown();
 
