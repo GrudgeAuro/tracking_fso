@@ -3,6 +3,9 @@
 
 #include <iostream>
 #include <unistd.h>
+#include <errno.h>
+#include <cstring>
+#include <fcntl.h>
 
 namespace
 {
@@ -97,10 +100,10 @@ bool VulkanRawProcessor::createMinMaxBuffer()
 
 bool VulkanRawProcessor::createDescriptorLayouts()
 {
-    // RAW layout: RAW buffer (binding 0) + output image (binding 1).
+    // RAW: input image (binding 0) + output mono image (binding 1).
     VkDescriptorSetLayoutBinding rawBindings[2]{};
     rawBindings[0].binding = 0;
-    rawBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    rawBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     rawBindings[0].descriptorCount = 1;
     rawBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
@@ -163,11 +166,11 @@ bool VulkanRawProcessor::createDescriptorPool()
 {
     VkDescriptorPoolSize sizes[] = {
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 10 }
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 }
     };
 
     VkDescriptorPoolCreateInfo ci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    ci.maxSets = 4;
+    ci.maxSets = 6;
     ci.poolSizeCount = 2;
     ci.pPoolSizes = sizes;
     return vkCreateDescriptorPool(device_, &ci, nullptr, &descriptorPool_) == VK_SUCCESS;
@@ -264,7 +267,7 @@ bool VulkanRawProcessor::createPipelines()
     VkDescriptorBufferInfo minInfo{ minBuffer_, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo maxInfo{ maxBuffer_, 0, VK_WHOLE_SIZE };
 
-    // Write mono output image to raw set (binding 1). RAW buffer (binding 0) will be written per-frame.
+    // Write mono output image into raw set at binding 1.
     VkWriteDescriptorSet rawWrites[1]{};
     rawWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
     rawWrites[0].dstSet = rawSet_;
@@ -274,25 +277,21 @@ bool VulkanRawProcessor::createPipelines()
     rawWrites[0].pImageInfo = &monoInfo;
     vkUpdateDescriptorSets(device_, 1, rawWrites, 0, nullptr);
 
-    VkDescriptorImageInfo mmImageInfo = medianInfo;
-    VkDescriptorBufferInfo minBufInfo = minInfo;
-    VkDescriptorBufferInfo maxBufInfo = maxInfo;
-
     VkWriteDescriptorSet mmWrites[3]{};
     mmWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
     mmWrites[0].dstSet = minMaxSet_;
     mmWrites[0].dstBinding = 0;
     mmWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     mmWrites[0].descriptorCount = 1;
-    mmWrites[0].pImageInfo = &mmImageInfo;
+    mmWrites[0].pImageInfo = &medianInfo;
     mmWrites[1] = mmWrites[0];
     mmWrites[1].dstBinding = 1;
     mmWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     mmWrites[1].pImageInfo = nullptr;
-    mmWrites[1].pBufferInfo = &minBufInfo;
+    mmWrites[1].pBufferInfo = &minInfo;
     mmWrites[2] = mmWrites[1];
     mmWrites[2].dstBinding = 2;
-    mmWrites[2].pBufferInfo = &maxBufInfo;
+    mmWrites[2].pBufferInfo = &maxInfo;
     vkUpdateDescriptorSets(device_, 3, mmWrites, 0, nullptr);
 
     VkDescriptorImageInfo contrastInputs[2] = { medianInfo, contrastInfo };
@@ -319,85 +318,81 @@ bool VulkanRawProcessor::createPipelines()
     return true;
 }
 
-bool VulkanRawProcessor::importDmaBuf(const Frame& frame, ImportedBuffer& out)
+bool VulkanRawProcessor::importDmaBufAsImage(const Frame& frame, ImportedBuffer& out)
 {
+    // Duplicate the FD to control ownership semantics.
     int dupFd = ::dup(frame.dmabufFd);
     if (dupFd < 0)
     {
-        std::cerr << "[VulkanRawProcessor] dup(DMA-BUF) failed\n";
+        std::cerr << "[VulkanRawProcessor] dup(DMA-BUF) failed: " << strerror(errno) << "\n";
         return false;
     }
 
-    VkExternalMemoryBufferCreateInfo externalInfo{
-        VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO
-    };
-    externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    std::cerr << "[VulkanRawProcessor] Importing DMA-BUF fd=" << frame.dmabufFd << " dup=" << dupFd
+              << " size=" << frame.bufferSize << " width=" << frame.widthPixels
+              << " height=" << frame.heightPixels << "\n";
 
-    VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    bci.pNext = &externalInfo;
-    bci.size = frame.bufferSize;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkExternalMemoryImageCreateInfo extImgCI{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+    extImgCI.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
 
-    if (vkCreateBuffer(device_, &bci, nullptr, &out.buffer) != VK_SUCCESS)
+    VkImageCreateInfo imgCI{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    imgCI.pNext = &extImgCI;
+    imgCI.imageType = VK_IMAGE_TYPE_2D;
+    imgCI.format = kProcessFormat;
+    imgCI.extent = { frame.widthPixels, frame.heightPixels, 1 };
+    imgCI.mipLevels = 1;
+    imgCI.arrayLayers = 1;
+    imgCI.samples = VK_SAMPLE_COUNT_1_BIT;
+    imgCI.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imgCI.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imgCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imgCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkResult res = vkCreateImage(device_, &imgCI, nullptr, &out.image);
+    if (res != VK_SUCCESS)
     {
+        std::cerr << "[VulkanRawProcessor] vkCreateImage failed: " << res << "\n";
         ::close(dupFd);
         return false;
     }
 
     VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(device_, out.buffer, &req);
+    vkGetImageMemoryRequirements(device_, out.image, &req);
 
-    VkMemoryFdPropertiesKHR fdProps{
-        VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR
-    };
-
-
+    VkMemoryFdPropertiesKHR fdProps{ VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR };
     PFN_vkGetMemoryFdPropertiesKHR pfnGetMemoryFdPropertiesKHR =
-    reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
-        vkGetDeviceProcAddr(device_, "vkGetMemoryFdPropertiesKHR"));
-
+        reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetMemoryFdPropertiesKHR"));
     if (!pfnGetMemoryFdPropertiesKHR)
     {
-        std::cerr << "[VulkanRawProcessor] "
-                     "vkGetMemoryFdPropertiesKHR not available\n";
-    
+        std::cerr << "[VulkanRawProcessor] vkGetMemoryFdPropertiesKHR not available\n";
         ::close(dupFd);
-        vkDestroyBuffer(device_, out.buffer, nullptr);
-        out.buffer = VK_NULL_HANDLE;
+        vkDestroyImage(device_, out.image, nullptr);
+        out.image = VK_NULL_HANDLE;
         return false;
     }
-    
-    VkResult result = pfnGetMemoryFdPropertiesKHR(
-        device_,
-        VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-        dupFd,
-        &fdProps);
 
-
-    if (result != VK_SUCCESS)
+    res = pfnGetMemoryFdPropertiesKHR(device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dupFd, &fdProps);
+    std::cerr << "[VulkanRawProcessor] vkGetMemoryFdPropertiesKHR -> " << res << ", memoryTypeBits=" << std::hex << fdProps.memoryTypeBits << std::dec << "\n";
+    if (res != VK_SUCCESS)
     {
         ::close(dupFd);
-        vkDestroyBuffer(device_, out.buffer, nullptr);
-        out.buffer = VK_NULL_HANDLE;
+        vkDestroyImage(device_, out.image, nullptr);
+        out.image = VK_NULL_HANDLE;
         return false;
     }
 
-    uint32_t memoryTypeIndex = VkUtils::findMemoryType(
-        ctx_->physicalDevice(), fdProps.memoryTypeBits,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
+    uint32_t memoryTypeIndex = VkUtils::findMemoryType(ctx_->physicalDevice(), fdProps.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (memoryTypeIndex == UINT32_MAX)
     {
+        std::cerr << "[VulkanRawProcessor] No suitable memory type for imported DMA-BUF\n";
         ::close(dupFd);
-        vkDestroyBuffer(device_, out.buffer, nullptr);
-        out.buffer = VK_NULL_HANDLE;
+        vkDestroyImage(device_, out.image, nullptr);
+        out.image = VK_NULL_HANDLE;
         return false;
     }
 
-    VkImportMemoryFdInfoKHR importInfo{
-        VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR
-    };
+    VkImportMemoryFdInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
     importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     importInfo.fd = dupFd;
 
@@ -406,74 +401,66 @@ bool VulkanRawProcessor::importDmaBuf(const Frame& frame, ImportedBuffer& out)
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = memoryTypeIndex;
 
-    result = vkAllocateMemory(device_, &mai, nullptr, &out.memory);
-    if (result != VK_SUCCESS)
+    res = vkAllocateMemory(device_, &mai, nullptr, &out.memory);
+    if (res != VK_SUCCESS)
     {
-        // On failure Vulkan does not take ownership of the fd.
+        std::cerr << "[VulkanRawProcessor] vkAllocateMemory(import) failed: " << res << "\n";
         ::close(dupFd);
-        vkDestroyBuffer(device_, out.buffer, nullptr);
-        out.buffer = VK_NULL_HANDLE;
+        vkDestroyImage(device_, out.image, nullptr);
+        out.image = VK_NULL_HANDLE;
         return false;
     }
 
-    result = vkBindBufferMemory(device_, out.buffer, out.memory, 0);
-    if (result != VK_SUCCESS)
+    res = vkBindImageMemory(device_, out.image, out.memory, 0);
+    if (res != VK_SUCCESS)
     {
+        std::cerr << "[VulkanRawProcessor] vkBindImageMemory failed: " << res << "\n";
         vkFreeMemory(device_, out.memory, nullptr);
-        vkDestroyBuffer(device_, out.buffer, nullptr);
+        vkDestroyImage(device_, out.image, nullptr);
         out.memory = VK_NULL_HANDLE;
-        out.buffer = VK_NULL_HANDLE;
+        out.image = VK_NULL_HANDLE;
+        return false;
+    }
+
+    // Create an image view for shader access.
+    out.view = VkUtils::createImageView2D(device_, out.image, kProcessFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!out.view)
+    {
+        std::cerr << "[VulkanRawProcessor] Failed to create image view for imported DMA-BUF\n";
+        vkFreeMemory(device_, out.memory, nullptr);
+        vkDestroyImage(device_, out.image, nullptr);
+        out.memory = VK_NULL_HANDLE;
+        out.image = VK_NULL_HANDLE;
         return false;
     }
 
     out.size = frame.bufferSize;
+    std::cerr << "[VulkanRawProcessor] Imported DMA-BUF as image view=" << out.view << "\n";
     return true;
 }
 
-bool VulkanRawProcessor::getImportedBuffer(const Frame& frame, VkBuffer& outBuffer)
+bool VulkanRawProcessor::getImportedImage(const Frame& frame, VkImageView& outView)
 {
     auto it = importedBuffers_.find(frame.dmabufFd);
     if (it == importedBuffers_.end())
     {
         ImportedBuffer resource;
-        if (!importDmaBuf(frame, resource))
+        if (!importDmaBufAsImage(frame, resource))
         {
-            std::cerr << "[VulkanRawProcessor] Failed to import camera DMA-BUF\n";
+            std::cerr << "[VulkanRawProcessor] Failed to import camera DMA-BUF as image\n";
             return false;
         }
         it = importedBuffers_.emplace(frame.dmabufFd, resource).first;
     }
 
-    outBuffer = it->second.buffer;
+    outView = it->second.view;
     return true;
-}
-
-void VulkanRawProcessor::transitionImage(
-    VkCommandBuffer cmd, VkImage image,
-    VkImageLayout oldLayout, VkImageLayout newLayout,
-    VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
-    VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess)
-{
-    VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-    barrier.srcStageMask = srcStage;
-    barrier.srcAccessMask = srcAccess;
-    barrier.dstStageMask = dstStage;
-    barrier.dstAccessMask = dstAccess;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.image = image;
-    barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    dep.imageMemoryBarrierCount = 1;
-    dep.pImageMemoryBarriers = &barrier;
-    ctx_->cmdPipelineBarrier2()(cmd, &dep);
 }
 
 bool VulkanRawProcessor::record(VkCommandBuffer cmd, const Frame& frame)
 {
-    VkBuffer rawBuffer = VK_NULL_HANDLE;
-    if (!getImportedBuffer(frame, rawBuffer))
+    VkImageView rawView = VK_NULL_HANDLE;
+    if (!getImportedImage(frame, rawView))
         return false;
 
     auto barrier2 = ctx_->cmdPipelineBarrier2();
@@ -521,14 +508,14 @@ bool VulkanRawProcessor::record(VkCommandBuffer cmd, const Frame& frame)
         contrastShaderRead_ = true;
     }
 
-    // RAW descriptor is rewritten because the camera DMA-BUF changes.
-    VkDescriptorBufferInfo rawInfo{ rawBuffer, 0, VK_WHOLE_SIZE };
+    // RAW descriptor: update binding 0 with the imported camera image view.
+    VkDescriptorImageInfo rawImgInfo{ VK_NULL_HANDLE, rawView, VK_IMAGE_LAYOUT_GENERAL };
     VkWriteDescriptorSet rawWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
     rawWrite.dstSet = rawSet_;
     rawWrite.dstBinding = 0;
-    rawWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    rawWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     rawWrite.descriptorCount = 1;
-    rawWrite.pBufferInfo = &rawInfo;
+    rawWrite.pImageInfo = &rawImgInfo;
     vkUpdateDescriptorSets(device_, 1, &rawWrite, 0, nullptr);
 
     // 1. Bayer -> monochrome.
