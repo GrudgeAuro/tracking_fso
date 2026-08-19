@@ -50,9 +50,7 @@ bool VulkanDisplayStage::init(int width, int height)
     if (!ctx_.init(window_, enableValidation_))
         return false;
 
-    // Create the GPU demosaic stage now that the VulkanContext exists. If the
-    // platform supports dmabuf import the stage will be used; otherwise it
-    // will not be invoked.
+    // Create the GPU demosaic stage now that the VulkanContext exists.
     demosaicStage_ = new VulkanDemosaicStage(ctx_.device(), ctx_.physicalDevice(), ctx_.commandPool(), ctx_.queue());
 
     if (!createTextureResources()) return false;
@@ -489,11 +487,12 @@ bool VulkanDisplayStage::process(const Frame& frame)
         return shouldContinue();
     }
 
-    // If the frame carries a dmabuf fd, use the zero-copy GPU demosaic path.
-    if (frame.dmabufFd != -1 && demosaicStage_)
+    // If the frame carries staging buffer data, use the GPU demosaic path.
+    if (!frame.stagingBuffer.empty() && demosaicStage_)
     {
-        std::cerr << "[mapYPlane] handing duped fd to VulkanDemosaic\n";
-        if (!demosaicStage_->processDmabuf(frame.dmabufFd, frame.dmabufWidth, frame.dmabufHeight))
+        std::cerr << "[VulkanDisplayStage] processing staging buffer (" 
+                  << frame.stagingWidth << "x" << frame.stagingHeight << ") via GPU demosaic\n";
+        if (!demosaicStage_->processStagingBuffer(frame.stagingBuffer, frame.stagingWidth, frame.stagingHeight))
         {
             std::cerr << "[VulkanDisplayStage] VulkanDemosaicStage failed\n";
             return false; // per your instruction: no fallback
