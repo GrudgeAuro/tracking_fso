@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <utility>
+#include <sys/mman.h>
 
 // Frame is the common currency between the camera source and ANY consumer:
 // the Vulkan display stage today, and later e.g. an Ethernet/UDP sink that
