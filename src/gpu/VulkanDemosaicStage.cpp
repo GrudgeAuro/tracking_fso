@@ -1,13 +1,8 @@
 #include "VulkanDemosaicStage.h"
 #include "VkUtils.h"
-#include "VkUtils.h"
 #include <iostream>
 #include <chrono>
 #include <vector>
-
-// For simplicity we assume the SPIR-V for demosaic.comp is available at
-// "shaders/demosaic.comp.spv" relative to the working directory (CMake
-// compiles it there).
 
 VulkanDemosaicStage::VulkanDemosaicStage(VkDevice device, VkPhysicalDevice phys, VkCommandPool cmdPool, VkQueue queue)
     : device_(device), phys_(phys), cmdPool_(cmdPool), queue_(queue)
@@ -226,8 +221,11 @@ bool VulkanDemosaicStage::processDmabuf(int dmabufFd, uint32_t width, uint32_t h
     VkImageMemoryBarrier barrierOut = barrierIn;
     barrierOut.image = outImage_;
 
+    // Create a vector to hold the barriers
+    std::vector<VkImageMemoryBarrier> barriers = { barrierIn, barrierOut };
+
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 0, nullptr, 0, nullptr, 2, (VkImageMemoryBarrier[]){ barrierIn, barrierOut });
+                         0, 0, nullptr, 0, nullptr, static_cast<uint32_t>(barriers.size()), barriers.data());
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &descSet_, 0, nullptr);
