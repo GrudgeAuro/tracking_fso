@@ -197,15 +197,10 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
     uint8_t* yData = static_cast<uint8_t*>(base) + yPlane.offset;
 
     // Wrap the Y plane as a CV_8UC1 Mat WITHOUT cloning.
-    // This creates a header pointing to the mmap'd buffer directly.
-    // The buffer stays valid until munmap(), which we do at the end of grabFrame().
-    // Note: outFrame.image.release() is not called here to avoid double-free.
+    // The Frame now owns the mmap region and will munmap it when destroyed or moved.
     outFrame.image = cv::Mat(height_, width_, CV_8UC1, yData, yStride_);
-
-    // Store the mmap info so we can unmap it after the frame is consumed
-    // For now, we'll unmap immediately after returning, which is safe because
-    // the display stage gets the frame synchronously in main.cpp.
-    munmap(base, mapLength);
+    outFrame.mmapBase = base;
+    outFrame.mmapLength = mapLength;
 
     return true;
 }
