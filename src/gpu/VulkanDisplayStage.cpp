@@ -74,9 +74,10 @@ bool VulkanDisplayStage::createTextureResources()
     textureView_ = VkUtils::createImageView2D(device, textureImage_, kYChannelFormat, VK_IMAGE_ASPECT_COLOR_BIT);
     if (textureView_ == VK_NULL_HANDLE) return false;
 
+    // R16_UINT does not support linear filtering, must use NEAREST
     VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-    sci.magFilter = VK_FILTER_LINEAR;
-    sci.minFilter = VK_FILTER_LINEAR;
+    sci.magFilter = VK_FILTER_NEAREST;
+    sci.minFilter = VK_FILTER_NEAREST;
     sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
