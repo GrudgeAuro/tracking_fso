@@ -18,6 +18,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <string>
+#include <chrono>
 
 class RaspberryPiCameraSource : public ICameraSource
 {
@@ -63,4 +64,8 @@ private:
     unsigned int yStride_ = 0;
     double fps_ = 0.0;
     bool open_ = false;
+
+    // Frame arrival rate tracking
+    std::chrono::high_resolution_clock::time_point lastFrameTime_;
+    int frameCount_ = 0;
 };
