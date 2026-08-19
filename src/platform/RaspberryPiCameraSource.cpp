@@ -101,6 +101,8 @@ bool RaspberryPiCameraSource::open(int width, int height, int fps)
 
     std::cout << "[RaspberryPiCameraSource] Format: " << streamConfig.pixelFormat.toString()
               << ", Y stride: " << yStride_ << " bytes\n";
+    std::cout << "[RaspberryPiCameraSource] Configured size: " << streamConfig.size.width 
+              << "x" << streamConfig.size.height << "\n";
 
     allocator_ = std::make_unique<FrameBufferAllocator>(camera_);
     if (allocator_->allocate(stream_) < 0)
@@ -133,6 +135,8 @@ bool RaspberryPiCameraSource::open(int width, int height, int fps)
     if (fps > 0)
     {
         frameDurationUs = 1'000'000 / fps;
+        std::cout << "[RaspberryPiCameraSource] Requested fps: " << fps 
+                  << ", frame duration: " << frameDurationUs << " us\n";
     }
     else
     {
@@ -153,6 +157,9 @@ bool RaspberryPiCameraSource::open(int width, int height, int fps)
     controls.set(controls::FrameDurationLimits,
                  Span<const int64_t, 2>({ frameDurationUs, frameDurationUs }));
     fps_ = 1'000'000.0 / static_cast<double>(frameDurationUs);
+
+    std::cout << "[RaspberryPiCameraSource] Final frame duration: " << frameDurationUs 
+              << " us, configured fps: " << fps_ << "\n";
 
     if (camera_->start(&controls))
     {
