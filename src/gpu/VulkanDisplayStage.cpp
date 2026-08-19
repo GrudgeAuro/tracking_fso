@@ -8,10 +8,9 @@
 
 namespace
 {
-// Use R16_UNORM format for display texture sampling. Values are normalized
-// to [0..1] during sampling. This format is compatible with LINEAR tiling
-// on Pi 5 V3D driver and supports both STORAGE and SAMPLED_BIT usage.
-constexpr VkFormat kYChannelFormat = VK_FORMAT_R16_UNORM;
+// Use R16_UINT format for display texture. This format is compatible with
+// compute shader storage image operations and matches the demosaic output format.
+constexpr VkFormat kYChannelFormat = VK_FORMAT_R16_UINT;
 }
 
 VulkanDisplayStage::VulkanDisplayStage(const char* windowTitle, bool enableValidation)
