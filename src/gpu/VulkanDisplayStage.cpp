@@ -8,10 +8,10 @@
 
 namespace
 {
-// Use a 16-bit unsigned integer format for display sampling so the fragment
-// shader can sample the GPU-produced R16_UINT image directly as unsigned
-// integers and convert to normalized floats for preview.
-constexpr VkFormat kYChannelFormat = VK_FORMAT_R16_UINT;
+// Use R16_UNORM format for display texture sampling. Values are normalized
+// to [0..1] during sampling. This format is compatible with LINEAR tiling
+// on Pi 5 V3D driver and supports both STORAGE and SAMPLED_BIT usage.
+constexpr VkFormat kYChannelFormat = VK_FORMAT_R16_UNORM;
 }
 
 VulkanDisplayStage::VulkanDisplayStage(const char* windowTitle, bool enableValidation)
@@ -83,7 +83,7 @@ bool VulkanDisplayStage::createTextureResources()
     sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sci.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
     sci.unnormalizedCoordinates = VK_FALSE;
     if (vkCreateSampler(device, &sci, nullptr, &sampler_) != VK_SUCCESS)
     {
