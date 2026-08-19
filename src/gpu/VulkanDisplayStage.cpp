@@ -1,6 +1,5 @@
 #include "VulkanDisplayStage.h"
 #include "VkUtils.h"
-#include "VulkanDemosaicStage.h"
 
 #include <GLFW/glfw3.h>
 #include <iostream>
@@ -8,9 +7,8 @@
 
 namespace
 {
-// Use R16_UINT format for display texture. This format is compatible with
-// compute shader storage image operations and matches the demosaic output format.
-constexpr VkFormat kYChannelFormat = VK_FORMAT_R16_UINT;
+// Use R8_UNORM format for 8-bit Y channel display
+constexpr VkFormat kYChannelFormat = VK_FORMAT_R8_UNORM;
 }
 
 VulkanDisplayStage::VulkanDisplayStage(const char* windowTitle, bool enableValidation)
@@ -50,9 +48,6 @@ bool VulkanDisplayStage::init(int width, int height)
     if (!ctx_.init(window_, enableValidation_))
         return false;
 
-    // Create the GPU demosaic stage now that the VulkanContext exists.
-    demosaicStage_ = new VulkanDemosaicStage(ctx_.device(), ctx_.physicalDevice(), ctx_.commandPool(), ctx_.queue());
-
     if (!createTextureResources()) return false;
     if (!createDescriptors()) return false;
     if (!createPipeline()) return false;
@@ -74,10 +69,10 @@ bool VulkanDisplayStage::createTextureResources()
     textureView_ = VkUtils::createImageView2D(device, textureImage_, kYChannelFormat, VK_IMAGE_ASPECT_COLOR_BIT);
     if (textureView_ == VK_NULL_HANDLE) return false;
 
-    // R16_UINT does not support linear filtering, must use NEAREST
+    // R8_UNORM supports linear filtering
     VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-    sci.magFilter = VK_FILTER_NEAREST;
-    sci.minFilter = VK_FILTER_NEAREST;
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
     sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -89,8 +84,8 @@ bool VulkanDisplayStage::createTextureResources()
         return false;
     }
 
-    // Staging buffer holds 2 bytes per pixel for CV_16UC1 -> R16 image.
-    const VkDeviceSize stagingSize = static_cast<VkDeviceSize>(width_) * static_cast<VkDeviceSize>(height_) * 2ull;
+    // Staging buffer holds 1 byte per pixel for CV_8UC1 -> R8 image.
+    const VkDeviceSize stagingSize = static_cast<VkDeviceSize>(width_) * static_cast<VkDeviceSize>(height_);
     if (!VkUtils::createBuffer(device, phys, stagingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                 stagingBuffer_, stagingMemory_))
@@ -140,9 +135,6 @@ bool VulkanDisplayStage::createDescriptors()
         return false;
     }
 
-    // Initially point descriptor at the CPU-backed texture image. When the
-    // GPU demosaic path is used we update the descriptor to point at the
-    // VulkanDemosaicStage's output image view.
     VkDescriptorImageInfo imageInfo{};
     imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     imageInfo.imageView = textureView_;
@@ -183,8 +175,6 @@ bool VulkanDisplayStage::createPipeline()
     stages[1].pName = "main";
 
     VkPipelineVertexInputStateCreateInfo vertexInput{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    // No bindings/attributes: the fullscreen triangle is generated in the
-    // vertex shader from gl_VertexIndex alone.
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -225,8 +215,6 @@ bool VulkanDisplayStage::createPipeline()
         return false;
     }
 
-    // Dynamic rendering: pipeline declares the color attachment format it
-    // will render to instead of referencing a VkRenderPass object.
     VkFormat swapFormat = ctx_.swapchainFormat();
     VkPipelineRenderingCreateInfo renderingInfo{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
     renderingInfo.colorAttachmentCount = 1;
@@ -271,19 +259,17 @@ void VulkanDisplayStage::uploadFrame(
 
     if (!stagingMapped_)
     {
-        std::cerr
-            << "[uploadFrame] ERROR: stagingMapped_ is null\n";
+        std::cerr << "[uploadFrame] ERROR: stagingMapped_ is null\n";
         return;
     }
 
-    // Expect CV_16UC1 with 2 bytes per pixel
-    const size_t rowBytes = static_cast<size_t>(width_) * 2;
+    // Expect CV_8UC1 with 1 byte per pixel
+    const size_t rowBytes = static_cast<size_t>(width_);
 
-    uint8_t* dst =
-        static_cast<uint8_t*>(stagingMapped_);
+    uint8_t* dst = static_cast<uint8_t*>(stagingMapped_);
 
-    if (frame.image.type() != CV_16UC1) {
-        std::cerr << "[uploadFrame] ERROR: expected CV_16UC1, got type=" << frame.image.type() << "\n";
+    if (frame.image.type() != CV_8UC1) {
+        std::cerr << "[uploadFrame] ERROR: expected CV_8UC1, got type=" << frame.image.type() << "\n";
         return;
     }
 
@@ -308,25 +294,15 @@ void VulkanDisplayStage::uploadFrame(
         }
     }
 
-    // ------------------------------------------------------------
-    // Get KHR synchronization2 function.
-    // ------------------------------------------------------------
-
-    auto cmdPipelineBarrier2 =
-        ctx_.cmdPipelineBarrier2();
+    auto cmdPipelineBarrier2 = ctx_.cmdPipelineBarrier2();
 
     if (!cmdPipelineBarrier2)
     {
-        std::cerr
-            << "[uploadFrame] ERROR: "
-               "ctx_.cmdPipelineBarrier2() is NULL\n";
+        std::cerr << "[uploadFrame] ERROR: ctx_.cmdPipelineBarrier2() is NULL\n";
         return;
     }
 
-    // ------------------------------------------------------------
-    // Transition texture -> TRANSFER_DST.
-    // ------------------------------------------------------------
-
+    // Transition texture -> TRANSFER_DST
     VkImageMemoryBarrier2 toTransferDst{
         VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2
     };
@@ -341,53 +317,28 @@ void VulkanDisplayStage::uploadFrame(
             ? VK_ACCESS_2_SHADER_READ_BIT
             : 0;
 
-    toTransferDst.dstStageMask =
-        VK_PIPELINE_STAGE_2_COPY_BIT;
-
-    toTransferDst.dstAccessMask =
-        VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toTransferDst.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    toTransferDst.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
 
     toTransferDst.oldLayout =
         textureLayoutIsShaderRead_
             ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
             : VK_IMAGE_LAYOUT_UNDEFINED;
 
-    toTransferDst.newLayout =
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-
-    toTransferDst.image =
-        textureImage_;
-
+    toTransferDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransferDst.image = textureImage_;
     toTransferDst.subresourceRange = {
-        VK_IMAGE_ASPECT_COLOR_BIT,
-        0,
-        1,
-        0,
-        1
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1
     };
 
-    VkDependencyInfo dep1{
-        VK_STRUCTURE_TYPE_DEPENDENCY_INFO
-    };
-
+    VkDependencyInfo dep1{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     dep1.imageMemoryBarrierCount = 1;
     dep1.pImageMemoryBarriers = &toTransferDst;
-
     cmdPipelineBarrier2(cmd, &dep1);
 
-    // ------------------------------------------------------------
-    // Copy staging buffer -> image.
-    // ------------------------------------------------------------
-
+    // Copy staging buffer -> image
     VkBufferImageCopy region{};
-
-    region.imageSubresource = {
-        VK_IMAGE_ASPECT_COLOR_BIT,
-        0,
-        0,
-        1
-    };
-
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.imageExtent = {
         static_cast<uint32_t>(width_),
         static_cast<uint32_t>(height_),
@@ -403,69 +354,29 @@ void VulkanDisplayStage::uploadFrame(
         &region
     );
 
-    // ------------------------------------------------------------
-    // Transition texture -> SHADER_READ_ONLY.
-    // ------------------------------------------------------------
-
+    // Transition texture -> SHADER_READ_ONLY
     VkImageMemoryBarrier2 toShaderRead{
         VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2
     };
 
-    toShaderRead.srcStageMask =
-        VK_PIPELINE_STAGE_2_COPY_BIT;
-
-    toShaderRead.srcAccessMask =
-        VK_ACCESS_2_TRANSFER_WRITE_BIT;
-
-    toShaderRead.dstStageMask =
-        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-
-    toShaderRead.dstAccessMask =
-        VK_ACCESS_2_SHADER_READ_BIT;
-
-    toShaderRead.oldLayout =
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-
-    toShaderRead.newLayout =
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    toShaderRead.image =
-        textureImage_;
-
+    toShaderRead.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    toShaderRead.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toShaderRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toShaderRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    toShaderRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toShaderRead.image = textureImage_;
     toShaderRead.subresourceRange = {
-        VK_IMAGE_ASPECT_COLOR_BIT,
-        0,
-        1,
-        0,
-        1
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1
     };
 
-    VkDependencyInfo dep2{
-        VK_STRUCTURE_TYPE_DEPENDENCY_INFO
-    };
-
+    VkDependencyInfo dep2{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     dep2.imageMemoryBarrierCount = 1;
     dep2.pImageMemoryBarriers = &toShaderRead;
-
     cmdPipelineBarrier2(cmd, &dep2);
 
     textureLayoutIsShaderRead_ = true;
-
-    // Ensure the descriptor points at the CPU-backed texture for subsequent frames
-    VkDescriptorImageInfo imageInfo{};
-    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageInfo.imageView = textureView_;
-    imageInfo.sampler = sampler_;
-
-    VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-    write.dstSet = descriptorSet_;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &imageInfo;
-    vkUpdateDescriptorSets(ctx_.device(), 1, &write, 0, nullptr);
 }
-
 
 
 bool VulkanDisplayStage::process(const Frame& frame)
@@ -488,41 +399,9 @@ bool VulkanDisplayStage::process(const Frame& frame)
         return shouldContinue();
     }
 
-    // If the frame carries staging buffer data, use the GPU demosaic path.
-    if (!frame.stagingBuffer.empty() && demosaicStage_)
-    {
-        std::cerr << "[VulkanDisplayStage] processing staging buffer (" 
-                  << frame.stagingWidth << "x" << frame.stagingHeight << ") via GPU demosaic\n";
-        if (!demosaicStage_->processStagingBuffer(frame.stagingBuffer, frame.stagingWidth, frame.stagingHeight))
-        {
-            std::cerr << "[VulkanDisplayStage] VulkanDemosaicStage failed\n";
-            return false; // per your instruction: no fallback
-        }
+    // Upload camera frame into texture
+    uploadFrame(cmd, frame);
 
-        // Update descriptor to point at the demosaic stage's output image view.
-        VkDescriptorImageInfo imageInfo{};
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        imageInfo.imageView = demosaicStage_->outputImageView();
-        imageInfo.sampler = sampler_;
-
-        VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        write.dstSet = descriptorSet_;
-        write.dstBinding = 0;
-        write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        write.pImageInfo = &imageInfo;
-        vkUpdateDescriptorSets(ctx_.device(), 1, &write, 0, nullptr);
-
-        // Mark texture as ready for shader read.
-        textureLayoutIsShaderRead_ = true;
-    }
-    else
-    {
-        // Upload camera frame into texture (CPU path)
-        uploadFrame(cmd, frame);
-    }
-
-    // Get Vulkan KHR function pointers
     auto cmdPipelineBarrier2 = ctx_.cmdPipelineBarrier2();
     auto cmdBeginRendering   = ctx_.cmdBeginRendering();
     auto cmdEndRendering     = ctx_.cmdEndRendering();
@@ -534,51 +413,28 @@ bool VulkanDisplayStage::process(const Frame& frame)
         std::cerr
             << "[process] ERROR: required Vulkan command function "
                "pointer is NULL\n";
-
         return shouldContinue();
     }
 
-    // Swapchain:
-    // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
+    // Swapchain: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
     VkImageMemoryBarrier2 toColorAttachment{
         VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2
     };
 
-    toColorAttachment.srcStageMask =
-        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-
+    toColorAttachment.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
     toColorAttachment.srcAccessMask = 0;
-
-    toColorAttachment.dstStageMask =
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-
-    toColorAttachment.dstAccessMask =
-        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-
-    toColorAttachment.oldLayout =
-        VK_IMAGE_LAYOUT_UNDEFINED;
-
-    toColorAttachment.newLayout =
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-    toColorAttachment.image =
-        ctx_.swapchainImage(imageIndex);
-
+    toColorAttachment.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toColorAttachment.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toColorAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toColorAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toColorAttachment.image = ctx_.swapchainImage(imageIndex);
     toColorAttachment.subresourceRange = {
-        VK_IMAGE_ASPECT_COLOR_BIT,
-        0,
-        1,
-        0,
-        1
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1
     };
 
-    VkDependencyInfo depToColor{
-        VK_STRUCTURE_TYPE_DEPENDENCY_INFO
-    };
-
+    VkDependencyInfo depToColor{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     depToColor.imageMemoryBarrierCount = 1;
     depToColor.pImageMemoryBarriers = &toColorAttachment;
-
     cmdPipelineBarrier2(cmd, &depToColor);
 
     // Begin dynamic rendering
@@ -586,31 +442,14 @@ bool VulkanDisplayStage::process(const Frame& frame)
         VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO
     };
 
-    colorAttachment.imageView =
-        ctx_.swapchainImageView(imageIndex);
+    colorAttachment.imageView = ctx_.swapchainImageView(imageIndex);
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.clearValue.color = {{ 0.0f, 0.0f, 0.0f, 1.0f }};
 
-    colorAttachment.imageLayout =
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-    colorAttachment.loadOp =
-        VK_ATTACHMENT_LOAD_OP_CLEAR;
-
-    colorAttachment.storeOp =
-        VK_ATTACHMENT_STORE_OP_STORE;
-
-    colorAttachment.clearValue.color = {
-        { 0.0f, 0.0f, 0.0f, 1.0f }
-    };
-
-    VkRenderingInfo renderingInfo{
-        VK_STRUCTURE_TYPE_RENDERING_INFO
-    };
-
-    renderingInfo.renderArea = {
-        { 0, 0 },
-        ctx_.swapchainExtent()
-    };
-
+    VkRenderingInfo renderingInfo{ VK_STRUCTURE_TYPE_RENDERING_INFO };
+    renderingInfo.renderArea = {{ 0, 0 }, ctx_.swapchainExtent()};
     renderingInfo.layerCount = 1;
     renderingInfo.colorAttachmentCount = 1;
     renderingInfo.pColorAttachments = &colorAttachment;
@@ -621,88 +460,53 @@ bool VulkanDisplayStage::process(const Frame& frame)
     VkExtent2D extent = ctx_.swapchainExtent();
 
     VkViewport viewport{
-        0.0f,
-        0.0f,
+        0.0f, 0.0f,
         static_cast<float>(extent.width),
         static_cast<float>(extent.height),
-        0.0f,
-        1.0f
+        0.0f, 1.0f
     };
 
-    VkRect2D scissor{
-        { 0, 0 },
-        extent
-    };
+    VkRect2D scissor{{ 0, 0 }, extent};
 
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
     // Bind graphics pipeline
-    vkCmdBindPipeline(
-        cmd,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
-        pipeline_
-    );
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
 
     // Bind descriptor set
     vkCmdBindDescriptorSets(
         cmd,
         VK_PIPELINE_BIND_POINT_GRAPHICS,
         pipelineLayout_,
-        0,
-        1,
-        &descriptorSet_,
-        0,
-        nullptr
+        0, 1, &descriptorSet_,
+        0, nullptr
     );
 
     // Draw fullscreen triangle
     vkCmdDraw(cmd, 3, 1, 0, 0);
 
-    // End dynamic rendering
     cmdEndRendering(cmd);
 
-    // Swapchain:
-    // COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
+    // Swapchain: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
     VkImageMemoryBarrier2 toPresent{
         VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2
     };
 
-    toPresent.srcStageMask =
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-
-    toPresent.srcAccessMask =
-        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-
-    toPresent.dstStageMask =
-        VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-
+    toPresent.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toPresent.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toPresent.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
     toPresent.dstAccessMask = 0;
-
-    toPresent.oldLayout =
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-    toPresent.newLayout =
-        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-    toPresent.image =
-        ctx_.swapchainImage(imageIndex);
-
+    toPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toPresent.image = ctx_.swapchainImage(imageIndex);
     toPresent.subresourceRange = {
-        VK_IMAGE_ASPECT_COLOR_BIT,
-        0,
-        1,
-        0,
-        1
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1
     };
 
-    VkDependencyInfo depToPresent{
-        VK_STRUCTURE_TYPE_DEPENDENCY_INFO
-    };
-
+    VkDependencyInfo depToPresent{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     depToPresent.imageMemoryBarrierCount = 1;
     depToPresent.pImageMemoryBarriers = &toPresent;
-
     cmdPipelineBarrier2(cmd, &depToPresent);
 
     // Submit and present
@@ -745,11 +549,6 @@ void VulkanDisplayStage::shutdown()
     if (descriptorSetLayout_) vkDestroyDescriptorSetLayout(device, descriptorSetLayout_, nullptr);
 
     destroyTextureResources();
-
-    if (demosaicStage_) {
-        delete demosaicStage_;
-        demosaicStage_ = nullptr;
-    }
 
     ctx_.shutdown();
 
