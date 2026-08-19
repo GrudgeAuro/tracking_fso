@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <sys/mman.h>
+#include <unistd.h>
 
 using namespace libcamera;
 
