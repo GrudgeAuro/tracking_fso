@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cstring>
+#include <chrono>
 
 using namespace libcamera;
 
@@ -163,6 +164,8 @@ bool RaspberryPiCameraSource::open(int width, int height, int fps)
         camera_->queueRequest(request.get());
 
     open_ = true;
+    lastFrameTime_ = std::chrono::high_resolution_clock::now();
+    frameCount_ = 0;
     std::cout << "[RaspberryPiCameraSource] Opened '" << camera_->id()
               << "' at " << width_ << "x" << height_
               << " @ " << fps_ << " fps (Y stride " << yStride_ << " bytes)\n";
@@ -228,6 +231,19 @@ bool RaspberryPiCameraSource::grabFrame(Frame& outFrame)
     outFrame.timestamp = std::chrono::steady_clock::now();
     static uint64_t seq = 0;
     outFrame.sequenceNumber = seq++;
+
+    // Track frame arrival rate
+    ++frameCount_;
+    auto now = std::chrono::high_resolution_clock::now();
+    auto elapsed = std::chrono::duration<double>(now - lastFrameTime_).count();
+
+    if (frameCount_ % 30 == 0)
+    {
+        double measuredFps = frameCount_ / elapsed;
+        std::cout << "[RaspberryPiCameraSource] Camera frame arrival: " << measuredFps << " fps\n";
+        lastFrameTime_ = now;
+        frameCount_ = 0;
+    }
 
     // Recycle the request so the camera can keep filling this buffer.
     request->reuse(Request::ReuseBuffers);
