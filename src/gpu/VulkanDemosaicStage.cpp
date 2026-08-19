@@ -3,6 +3,7 @@
 #include <iostream>
 #include <chrono>
 #include <vector>
+#include <cstring>
 
 VulkanDemosaicStage::VulkanDemosaicStage(VkDevice device, VkPhysicalDevice phys, VkCommandPool cmdPool, VkQueue queue)
     : device_(device), phys_(phys), cmdPool_(cmdPool), queue_(queue)
@@ -18,19 +19,141 @@ VulkanDemosaicStage::~VulkanDemosaicStage()
     if (outMemory_) vkFreeMemory(device_, outMemory_, nullptr);
     if (inImage_) vkDestroyImage(device_, inImage_, nullptr);
     if (inMemory_) vkFreeMemory(device_, inMemory_, nullptr);
+    if (stagingMapped_) vkUnmapMemory(device_, stagingMemory_);
+    if (stagingBuffer_) vkDestroyBuffer(device_, stagingBuffer_, nullptr);
+    if (stagingMemory_) vkFreeMemory(device_, stagingMemory_, nullptr);
 }
 
-bool VulkanDemosaicStage::importInput(int fd, uint32_t width, uint32_t height)
+bool VulkanDemosaicStage::ensureStagingBuffer(VkDeviceSize size)
 {
-    // Use R16_UINT with OPTIMAL tiling. The Pi 5 V3D driver should support this
-    // for external memory import (dmabuf).
-    if (!VkUtils::importImageFromDmabuf(device_, phys_, fd, width, height, VK_FORMAT_R16_UINT,
-                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-                                        inImage_, inMemory_))
+    if (stagingCapacity_ >= size)
+        return true; // buffer already large enough
+
+    // Destroy old buffer
+    if (stagingMapped_) vkUnmapMemory(device_, stagingMemory_);
+    stagingMapped_ = nullptr;
+    if (stagingBuffer_) vkDestroyBuffer(device_, stagingBuffer_, nullptr);
+    stagingBuffer_ = VK_NULL_HANDLE;
+    if (stagingMemory_) vkFreeMemory(device_, stagingMemory_, nullptr);
+    stagingMemory_ = VK_NULL_HANDLE;
+
+    // Create new buffer with host-visible, coherent memory
+    if (!VkUtils::createBuffer(device_, phys_, size,
+                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                stagingBuffer_, stagingMemory_))
     {
-        std::cerr << "[VulkanDemosaic] importImageFromDmabuf failed\n";
+        std::cerr << "[VulkanDemosaic] createBuffer for staging failed\n";
         return false;
     }
+
+    if (vkMapMemory(device_, stagingMemory_, 0, size, 0, &stagingMapped_) != VK_SUCCESS)
+    {
+        std::cerr << "[VulkanDemosaic] vkMapMemory failed\n";
+        vkDestroyBuffer(device_, stagingBuffer_, nullptr);
+        vkFreeMemory(device_, stagingMemory_, nullptr);
+        stagingBuffer_ = VK_NULL_HANDLE;
+        stagingMemory_ = VK_NULL_HANDLE;
+        return false;
+    }
+
+    stagingCapacity_ = size;
+    return true;
+}
+
+bool VulkanDemosaicStage::uploadToInputImage(const std::vector<uint8_t>& data, uint32_t width, uint32_t height)
+{
+    VkDeviceSize dataSize = data.size();
+    const size_t expectedSize = static_cast<size_t>(width) * static_cast<size_t>(height) * 2u;
+    if (dataSize < expectedSize)
+    {
+        std::cerr << "[VulkanDemosaic] Data size " << dataSize << " < expected " << expectedSize << "\n";
+        return false;
+    }
+
+    // Ensure staging buffer is large enough
+    if (!ensureStagingBuffer(dataSize))
+        return false;
+
+    // Copy data to staging buffer
+    std::memcpy(stagingMapped_, data.data(), dataSize);
+
+    // Create or recreate input image
+    if (inImage_)
+    {
+        vkDestroyImage(device_, inImage_, nullptr);
+        inImage_ = VK_NULL_HANDLE;
+    }
+    if (inMemory_)
+    {
+        vkFreeMemory(device_, inMemory_, nullptr);
+        inMemory_ = VK_NULL_HANDLE;
+    }
+
+    if (!VkUtils::createImage2D(device_, phys_, width, height, VK_FORMAT_R16_UINT,
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+                                inImage_, inMemory_))
+    {
+        std::cerr << "[VulkanDemosaic] createImage2D for input failed\n";
+        return false;
+    }
+
+    // Upload from staging buffer to input image
+    VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    ai.commandPool = cmdPool_;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    if (vkAllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS)
+    {
+        std::cerr << "[VulkanDemosaic] vkAllocateCommandBuffers failed\n";
+        return false;
+    }
+
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(cmd, &bi);
+
+    // Transition image to TRANSFER_DST
+    VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = inImage_;
+    barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    // Copy staging buffer to image
+    VkBufferImageCopy region{};
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent = { width, height, 1 };
+    vkCmdCopyBufferToImage(cmd, stagingBuffer_, inImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    // Transition image to GENERAL for compute read
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS)
+    {
+        std::cerr << "[VulkanDemosaic] vkQueueSubmit failed\n";
+        vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+        return false;
+    }
+
+    vkQueueWaitIdle(queue_);
+    vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
 
     return true;
 }
@@ -150,24 +273,26 @@ void VulkanDemosaicStage::destroyPipeline()
     if (descLayout_) vkDestroyDescriptorSetLayout(device_, descLayout_, nullptr);
 }
 
-bool VulkanDemosaicStage::processDmabuf(int dmabufFd, uint32_t width, uint32_t height)
+bool VulkanDemosaicStage::processStagingBuffer(const std::vector<uint8_t>& stagingBuffer, uint32_t width, uint32_t height)
 {
-    if (!importInput(dmabufFd, width, height))
+    if (!uploadToInputImage(stagingBuffer, width, height))
         return false;
 
     if (!createOutput(width, height))
         return false;
 
-    // Update descriptor set to point to input and output images
-    VkDescriptorImageInfo inInfo{};
-    inInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    // Need to create an image view for inImage
+    // Create image view for input
     VkImageView inView = VkUtils::createImageView2D(device_, inImage_, VK_FORMAT_R16_UINT, VK_IMAGE_ASPECT_COLOR_BIT);
     if (inView == VK_NULL_HANDLE)
     {
         std::cerr << "[VulkanDemosaic] createImageView2D for input failed\n";
         return false;
     }
+
+    // Update descriptor set
+    VkDescriptorImageInfo inInfo{};
+    inInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    inInfo.imageView = inView;
 
     VkDescriptorImageInfo outInfo{};
     outInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -188,11 +313,9 @@ bool VulkanDemosaicStage::processDmabuf(int dmabufFd, uint32_t width, uint32_t h
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[1].pImageInfo = &outInfo;
 
-    // Note: inInfo.imageView must be set now
-    inInfo.imageView = inView;
     vkUpdateDescriptorSets(device_, 2, writes, 0, nullptr);
 
-    // Create command buffer, dispatch compute shader
+    // Create command buffer and dispatch compute shader
     VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     ai.commandPool = cmdPool_;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -208,25 +331,19 @@ bool VulkanDemosaicStage::processDmabuf(int dmabufFd, uint32_t width, uint32_t h
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(cmd, &bi);
 
-    // Transition images to GENERAL layout for compute read/write
-    VkImageMemoryBarrier barrierIn{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    barrierIn.srcAccessMask = 0;
-    barrierIn.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    barrierIn.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrierIn.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barrierIn.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrierIn.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrierIn.image = inImage_;
-    barrierIn.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-    VkImageMemoryBarrier barrierOut = barrierIn;
+    // Transition output image to GENERAL
+    VkImageMemoryBarrier barrierOut{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    barrierOut.srcAccessMask = 0;
+    barrierOut.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrierOut.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrierOut.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrierOut.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrierOut.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrierOut.image = outImage_;
-
-    // Create a vector to hold the barriers
-    std::vector<VkImageMemoryBarrier> barriers = { barrierIn, barrierOut };
+    barrierOut.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 0, nullptr, 0, nullptr, static_cast<uint32_t>(barriers.size()), barriers.data());
+                         0, 0, nullptr, 0, nullptr, 1, &barrierOut);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &descSet_, 0, nullptr);
@@ -237,7 +354,7 @@ bool VulkanDemosaicStage::processDmabuf(int dmabufFd, uint32_t width, uint32_t h
     auto t0 = std::chrono::steady_clock::now();
     vkCmdDispatch(cmd, groupX, groupY, 1);
 
-    // Barrier to ensure compute writes are available for shader read (display)
+    // Barrier to ensure compute writes are available for shader read
     VkImageMemoryBarrier postBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
     postBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     postBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -269,9 +386,7 @@ bool VulkanDemosaicStage::processDmabuf(int dmabufFd, uint32_t width, uint32_t h
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     std::cerr << "[VulkanDemosaic] dispatched compute demosaic (" << groupX << "x" << groupY << ") took " << ms << " ms\n";
 
-    // Cleanup input view (input image and memory remain bound and owned)
     vkDestroyImageView(device_, inView, nullptr);
-
     vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
 
     return true;
