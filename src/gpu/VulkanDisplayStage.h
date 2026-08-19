@@ -3,15 +3,14 @@
 #include "IPipelineStage.h"
 #include "VulkanContext.h"
 #include <string>
+#include <chrono>
 
 struct GLFWwindow;
 class VulkanDemosaicStage;
 
-// Fundamental stage: uploads each Frame's luma channel (16-bit R16_UINT) to a
+// Fundamental stage: uploads each Frame's luma channel (8-bit R8_UNORM) to a
 // single-channel GPU texture and draws it full-screen via Vulkan. The GPU
-// fragment shader maps the 16-bit mono values to 8-bit for display, but the
-// underlying Frame passed to the pipeline remains CV_16UC1 so signal
-// processing can operate on the full 16-bit luma values.
+// fragment shader replicates the 8-bit mono values across RGB for display.
 //
 // This owns the VulkanContext (instance/device/swapchain) since it's the
 // only stage today. When the PRBS correlator stage is added, promote
@@ -46,7 +45,7 @@ private:
 
     int width_ = 0, height_ = 0;
 
-    // Luma texture (R16_UINT) sampled by the fragment shader + its staging buffer.
+    // Luma texture (R8_UNORM) sampled by the fragment shader + its staging buffer.
     VkImage textureImage_ = VK_NULL_HANDLE;
     VkDeviceMemory textureMemory_ = VK_NULL_HANDLE;
     VkImageView textureView_ = VK_NULL_HANDLE;
@@ -67,6 +66,10 @@ private:
     // VulkanContext. If non-null, the camera will hand dmabuf fds to it for
     // zero-copy demosaic.
     VulkanDemosaicStage* demosaicStage_ = nullptr;
+
+    // Frame rate logging
+    std::chrono::high_resolution_clock::time_point lastFrameTime_;
+    int frameCount_ = 0;
 
     bool initialized_ = false;
 };
