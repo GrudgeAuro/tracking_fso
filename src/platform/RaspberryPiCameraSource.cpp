@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cstring>
+#include <chrono>
 
 using namespace libcamera;
 
@@ -183,6 +184,8 @@ void RaspberryPiCameraSource::onRequestComplete(Request* request)
 
 bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFrame)
 {
+    auto copyStart = std::chrono::high_resolution_clock::now();
+
     const FrameBuffer::Plane& yPlane = buffer->planes()[0];
 
     // Map dmabuf for CPU read
@@ -202,7 +205,11 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
 
     munmap(base, mapLength);
 
-    std::cerr << "[mapYPlane] captured 8-bit Y channel (" << width_ << "x" << height_ << ")\n";
+    auto copyEnd = std::chrono::high_resolution_clock::now();
+    auto copyDurationMs = std::chrono::duration<double, std::milli>(copyEnd - copyStart).count();
+
+    std::cerr << "[CPU copy] Y plane: " << copyDurationMs << " ms\n";
+
     return true;
 }
 
