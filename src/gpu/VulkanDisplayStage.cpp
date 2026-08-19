@@ -53,9 +53,6 @@ bool VulkanDisplayStage::init(int width, int height)
     if (!createDescriptors()) return false;
     if (!createPipeline()) return false;
 
-    lastFrameTime_ = std::chrono::high_resolution_clock::now();
-    frameCount_ = 0;
-
     initialized_ = true;
     return true;
 }
@@ -516,19 +513,6 @@ bool VulkanDisplayStage::process(const Frame& frame)
     // Submit and present
     if (!ctx_.endFrame(imageIndex, cmd))
         ctx_.recreateSwapchain();
-
-    // Calculate and print frame rate every 30 frames
-    ++frameCount_;
-    auto now = std::chrono::high_resolution_clock::now();
-    auto elapsed = std::chrono::duration<double>(now - lastFrameTime_).count();
-
-    if (frameCount_ % 30 == 0)
-    {
-        double fps = frameCount_ / elapsed;
-        std::cout << "[VulkanDisplayStage] FPS: " << fps << "\n";
-        lastFrameTime_ = now;
-        frameCount_ = 0;
-    }
 
     return shouldContinue();
 }
