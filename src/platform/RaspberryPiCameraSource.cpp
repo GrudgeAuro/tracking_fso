@@ -213,7 +213,7 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
         if (base == MAP_FAILED)
         {
             std::cerr << "[RaspberryPiCameraSource] mmap() failed\n";
-            close(dupFd);
+            ::close(dupFd);
             return false;
         }
 
@@ -233,11 +233,11 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
         }
 
         munmap(base, mapLength);
-        close(dupFd);
+        ::close(dupFd);
 
         outFrame.dmabufFd = -1; // no dmabuf needed for GPU path
-        outFrame.dmabufWidth = width_;
-        outFrame.dmabufHeight = height_;
+        outFrame.stagingWidth = width_;
+        outFrame.stagingHeight = height_;
         outFrame.image = cv::Mat(); // empty; GPU path will process staging buffer
 
         std::cerr << "[mapYPlane] copied RAW to staging buffer for GPU demosaic\n";
