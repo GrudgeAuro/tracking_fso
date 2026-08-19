@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <vector>
 
 struct Frame;
 
@@ -11,12 +12,11 @@ public:
     VulkanDemosaicStage(VkDevice device, VkPhysicalDevice phys, VkCommandPool cmdPool, VkQueue queue);
     ~VulkanDemosaicStage();
 
-    // Import the camera plane dmabuf (fd) and run the compute demosaic.
-    // - dmabufFd: file descriptor for the dmabuf containing left-aligned 12-bit
-    //   samples packed in a 16-bit container (value = sample12 << 4).
+    // Process staging buffer containing raw 16-bit BGGR12 data via GPU compute shader.
+    // - stagingBuffer: host-visible buffer with raw 16-bit samples (left-aligned 12-bit in 16-bit container)
     // - width/height: image dimensions
     // Returns true on success and makes the resulting image view available via outputImageView().
-    bool processDmabuf(int dmabufFd, uint32_t width, uint32_t height);
+    bool processStagingBuffer(const std::vector<uint8_t>& stagingBuffer, uint32_t width, uint32_t height);
 
     VkImageView outputImageView() const { return outView_; }
 
@@ -25,6 +25,11 @@ private:
     VkPhysicalDevice phys_;
     VkCommandPool cmdPool_;
     VkQueue queue_;
+
+    VkBuffer stagingBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory_ = VK_NULL_HANDLE;
+    void* stagingMapped_ = nullptr;
+    VkDeviceSize stagingCapacity_ = 0;
 
     VkImage inImage_ = VK_NULL_HANDLE;
     VkDeviceMemory inMemory_ = VK_NULL_HANDLE;
@@ -42,6 +47,7 @@ private:
     bool createPipeline();
     void destroyPipeline();
 
-    bool importInput(int fd, uint32_t width, uint32_t height);
+    bool ensureStagingBuffer(VkDeviceSize size);
+    bool uploadToInputImage(const std::vector<uint8_t>& data, uint32_t width, uint32_t height);
     bool createOutput(uint32_t width, uint32_t height);
 };
