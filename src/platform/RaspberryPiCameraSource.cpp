@@ -62,26 +62,17 @@ bool RaspberryPiCameraSource::open(int width, int height, int fps)
         return false;
     }
 
-    // Try RAW first; fall back to VideoRecording if unavailable.
-    config_ = camera_->generateConfiguration({ StreamRole::Raw });
+    // Use VideoRecording role to get YUV420 (or similar) with Y plane
+    config_ = camera_->generateConfiguration({ StreamRole::VideoRecording });
     if (!config_ || config_->empty())
     {
-        std::cerr << "[RaspberryPiCameraSource] RAW stream role not available; falling back to VideoRecording (Y plane)\n";
-        config_ = camera_->generateConfiguration({ StreamRole::VideoRecording });
-        if (!config_ || config_->empty())
-        {
-            std::cerr << "[RaspberryPiCameraSource] Failed to generate configuration\n";
-            return false;
-        }
+        std::cerr << "[RaspberryPiCameraSource] Failed to generate configuration\n";
+        return false;
     }
 
     StreamConfiguration& streamConfig = config_->at(0);
     streamConfig.size.width = width;
     streamConfig.size.height = height;
-
-    // Prefer RAW SBGGR12; if not available, libcamera will adjust to an
-    // available format (e.g., YUV420) during validate()/configure().
-    streamConfig.pixelFormat = formats::SBGGR12;
 
     CameraConfiguration::Status status = config_->validate();
     if (status == CameraConfiguration::Invalid)
@@ -104,8 +95,11 @@ bool RaspberryPiCameraSource::open(int width, int height, int fps)
 
     width_ = static_cast<int>(streamConfig.size.width);
     height_ = static_cast<int>(streamConfig.size.height);
-    yStride_ = streamConfig.stride; // row stride of plane 0, in bytes
+    yStride_ = streamConfig.stride; // row stride of plane 0 (Y plane), in bytes
     stream_ = streamConfig.stream();
+
+    std::cout << "[RaspberryPiCameraSource] Format: " << streamConfig.pixelFormat.toString()
+              << ", Y stride: " << yStride_ << " bytes\n";
 
     allocator_ = std::make_unique<FrameBufferAllocator>(camera_);
     if (allocator_->allocate(stream_) < 0)
@@ -191,60 +185,7 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
 {
     const FrameBuffer::Plane& yPlane = buffer->planes()[0];
 
-    // Detect whether the plane appears to be 8-bit (Y) or 16-bit RAW.
-    const size_t bytesIf8 = static_cast<size_t>(yStride_) * static_cast<size_t>(height_);
-    const size_t bytesIf16 = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 2u;
-
-    if (yPlane.length >= bytesIf16 && yStride_ >= static_cast<unsigned int>(width_ * 2))
-    {
-        // RAW 16-bit data path: hand the dmabuf fd and a memcpy staging buffer
-        // to the GPU demosaic stage for GPU-based demosaic. The fd is kept alive
-        // just long enough for the memcpy; demosaic happens on GPU.
-        int dupFd = dup(yPlane.fd.get());
-        if (dupFd < 0)
-        {
-            std::cerr << "[RaspberryPiCameraSource] dup() failed for RAW dmabuf fd\n";
-            return false;
-        }
-
-        // Map dmabuf for CPU read
-        const size_t mapLength = yPlane.offset + yPlane.length;
-        void* base = mmap(nullptr, mapLength, PROT_READ, MAP_SHARED, dupFd, 0);
-        if (base == MAP_FAILED)
-        {
-            std::cerr << "[RaspberryPiCameraSource] mmap() failed\n";
-            ::close(dupFd);
-            return false;
-        }
-
-        uint8_t* yData = static_cast<uint8_t*>(base) + yPlane.offset;
-
-        // Allocate host-visible staging buffer for GPU upload
-        const size_t rowBytesNeeded = static_cast<size_t>(width_) * 2;
-        outFrame.stagingBuffer.resize(rowBytesNeeded * static_cast<size_t>(height_));
-
-        // Copy from dmabuf to staging buffer (fast memcpy, no demosaic)
-        uint8_t* dst = outFrame.stagingBuffer.data();
-        for (int r = 0; r < height_; ++r)
-        {
-            std::memcpy(dst + r * rowBytesNeeded, 
-                       yData + (size_t)r * yStride_, 
-                       rowBytesNeeded);
-        }
-
-        munmap(base, mapLength);
-        ::close(dupFd);
-
-        outFrame.dmabufFd = -1; // no dmabuf needed for GPU path
-        outFrame.stagingWidth = width_;
-        outFrame.stagingHeight = height_;
-        outFrame.image = cv::Mat(); // empty; GPU path will process staging buffer
-
-        std::cerr << "[mapYPlane] copied RAW to staging buffer for GPU demosaic\n";
-        return true;
-    }
-
-    // Fallback: 8-bit Y plane path — wrap, clone, promote to 16-bit full range
+    // Map dmabuf for CPU read
     const size_t mapLength = yPlane.offset + yPlane.length;
     void* base = mmap(nullptr, mapLength, PROT_READ, MAP_SHARED, yPlane.fd.get(), 0);
     if (base == MAP_FAILED)
@@ -255,14 +196,13 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
 
     uint8_t* yData = static_cast<uint8_t*>(base) + yPlane.offset;
 
+    // Wrap the Y plane as a CV_8UC1 Mat, then clone to get a contiguous buffer
     cv::Mat wrapped8(height_, width_, CV_8UC1, yData, yStride_);
-    cv::Mat contig8 = wrapped8.clone();
-    cv::Mat out16;
-    contig8.convertTo(out16, CV_16U, 257.0); // map 0..255 -> 0..65535
-    outFrame.image = out16;
+    outFrame.image = wrapped8.clone();
 
     munmap(base, mapLength);
-    std::cerr << "[mapYPlane] used 8-bit Y fallback -> CV_16UC1 mono\n";
+
+    std::cerr << "[mapYPlane] captured 8-bit Y channel (" << width_ << "x" << height_ << ")\n";
     return true;
 }
 
@@ -316,4 +256,4 @@ bool RaspberryPiCameraSource::isOpen() const { return open_; }
 int RaspberryPiCameraSource::width() const { return width_; }
 int RaspberryPiCameraSource::height() const { return height_; }
 double RaspberryPiCameraSource::fps() const { return fps_; }
-std::string RaspberryPiCameraSource::name() const { return "RaspberryPiCameraSource (libcamera, GPU demosaic via staging buffer)"; }
+std::string RaspberryPiCameraSource::name() const { return "RaspberryPiCameraSource (libcamera, 8-bit Y channel)"; }
