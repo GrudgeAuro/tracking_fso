@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <cstring>
 
 using namespace libcamera;
 
@@ -196,9 +197,9 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
 
     if (yPlane.length >= bytesIf16 && yStride_ >= static_cast<unsigned int>(width_ * 2))
     {
-        // RAW 16-bit data path: hand the dmabuf fd to the GPU demosaic stage
-        // for zero-copy import and GPU-based demosaic. We dup() the fd to
-        // avoid interfering with libcamera's ownership.
+        // RAW 16-bit data path: hand the dmabuf fd and a memcpy staging buffer
+        // to the GPU demosaic stage for GPU-based demosaic. The fd is kept alive
+        // just long enough for the memcpy; demosaic happens on GPU.
         int dupFd = dup(yPlane.fd.get());
         if (dupFd < 0)
         {
@@ -206,19 +207,44 @@ bool RaspberryPiCameraSource::mapYPlane(const FrameBuffer* buffer, Frame& outFra
             return false;
         }
 
-        outFrame.dmabufFd = dupFd;
+        // Map dmabuf for CPU read
+        const size_t mapLength = yPlane.offset + yPlane.length;
+        void* base = mmap(nullptr, mapLength, PROT_READ, MAP_SHARED, dupFd, 0);
+        if (base == MAP_FAILED)
+        {
+            std::cerr << "[RaspberryPiCameraSource] mmap() failed\n";
+            close(dupFd);
+            return false;
+        }
+
+        uint8_t* yData = static_cast<uint8_t*>(base) + yPlane.offset;
+
+        // Allocate host-visible staging buffer for GPU upload
+        const size_t rowBytesNeeded = static_cast<size_t>(width_) * 2;
+        outFrame.stagingBuffer.resize(rowBytesNeeded * static_cast<size_t>(height_));
+
+        // Copy from dmabuf to staging buffer (fast memcpy, no demosaic)
+        uint8_t* dst = outFrame.stagingBuffer.data();
+        for (int r = 0; r < height_; ++r)
+        {
+            std::memcpy(dst + r * rowBytesNeeded, 
+                       yData + (size_t)r * yStride_, 
+                       rowBytesNeeded);
+        }
+
+        munmap(base, mapLength);
+        close(dupFd);
+
+        outFrame.dmabufFd = -1; // no dmabuf needed for GPU path
         outFrame.dmabufWidth = width_;
         outFrame.dmabufHeight = height_;
-        outFrame.image = cv::Mat(); // empty; GPU path will process the dmabuf
+        outFrame.image = cv::Mat(); // empty; GPU path will process staging buffer
 
-        std::cerr << "[mapYPlane] handing duped fd=" << dupFd << " to VulkanDemosaic\n";
+        std::cerr << "[mapYPlane] copied RAW to staging buffer for GPU demosaic\n";
         return true;
     }
 
     // Fallback: 8-bit Y plane path — wrap, clone, promote to 16-bit full range
-    // Map from offset 0 through (offset + length): planes can share a
-    // single dmabuf fd at different offsets, so this is the only mapping
-    // that's correct regardless of how the ISP packed Y/U/V for this format.
     const size_t mapLength = yPlane.offset + yPlane.length;
     void* base = mmap(nullptr, mapLength, PROT_READ, MAP_SHARED, yPlane.fd.get(), 0);
     if (base == MAP_FAILED)
@@ -290,4 +316,4 @@ bool RaspberryPiCameraSource::isOpen() const { return open_; }
 int RaspberryPiCameraSource::width() const { return width_; }
 int RaspberryPiCameraSource::height() const { return height_; }
 double RaspberryPiCameraSource::fps() const { return fps_; }
-std::string RaspberryPiCameraSource::name() const { return "RaspberryPiCameraSource (libcamera, zero-copy GPU demosaic)"; }
+std::string RaspberryPiCameraSource::name() const { return "RaspberryPiCameraSource (libcamera, GPU demosaic via staging buffer)"; }
