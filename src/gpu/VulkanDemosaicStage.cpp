@@ -22,9 +22,9 @@ VulkanDemosaicStage::~VulkanDemosaicStage()
 
 bool VulkanDemosaicStage::importInput(int fd, uint32_t width, uint32_t height)
 {
-    // Use R16_UNORM for compatibility with LINEAR tiling and SAMPLED_BIT.
-    // Values are normalized to [0..1] automatically during sampling.
-    if (!VkUtils::importImageFromDmabuf(device_, phys_, fd, width, height, VK_FORMAT_R16_UNORM,
+    // Use R16_UINT with OPTIMAL tiling. The Pi 5 V3D driver should support this
+    // for external memory import (dmabuf).
+    if (!VkUtils::importImageFromDmabuf(device_, phys_, fd, width, height, VK_FORMAT_R16_UINT,
                                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                                         inImage_, inMemory_))
     {
@@ -37,8 +37,8 @@ bool VulkanDemosaicStage::importInput(int fd, uint32_t width, uint32_t height)
 
 bool VulkanDemosaicStage::createOutput(uint32_t width, uint32_t height)
 {
-    // Create device-local R16_UNORM output image (storage image)
-    if (!VkUtils::createImage2D(device_, phys_, width, height, VK_FORMAT_R16_UNORM,
+    // Create device-local R16_UINT output image (storage image)
+    if (!VkUtils::createImage2D(device_, phys_, width, height, VK_FORMAT_R16_UINT,
                                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                 outImage_, outMemory_))
     {
@@ -46,7 +46,7 @@ bool VulkanDemosaicStage::createOutput(uint32_t width, uint32_t height)
         return false;
     }
 
-    outView_ = VkUtils::createImageView2D(device_, outImage_, VK_FORMAT_R16_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+    outView_ = VkUtils::createImageView2D(device_, outImage_, VK_FORMAT_R16_UINT, VK_IMAGE_ASPECT_COLOR_BIT);
     if (outView_ == VK_NULL_HANDLE)
     {
         std::cerr << "[VulkanDemosaic] createImageView2D failed\n";
@@ -162,7 +162,7 @@ bool VulkanDemosaicStage::processDmabuf(int dmabufFd, uint32_t width, uint32_t h
     VkDescriptorImageInfo inInfo{};
     inInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     // Need to create an image view for inImage
-    VkImageView inView = VkUtils::createImageView2D(device_, inImage_, VK_FORMAT_R16_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageView inView = VkUtils::createImageView2D(device_, inImage_, VK_FORMAT_R16_UINT, VK_IMAGE_ASPECT_COLOR_BIT);
     if (inView == VK_NULL_HANDLE)
     {
         std::cerr << "[VulkanDemosaic] createImageView2D for input failed\n";
