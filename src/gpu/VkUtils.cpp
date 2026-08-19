@@ -13,7 +13,9 @@ bool importImageFromDmabuf(VkDevice device, VkPhysicalDevice physDevice,
                            VkFormat format, VkImageUsageFlags usage,
                            VkImage& outImage, VkDeviceMemory& outMemory)
 {
-    // Create image with external memory flag
+    // Create image with external memory flag.
+    // NOTE: Use LINEAR tiling for external memory imports on platforms that don't
+    // support OPTIMAL tiling with external memory (e.g., Pi 5 V3D driver).
     VkExternalMemoryImageCreateInfo extImg{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
     extImg.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
 
@@ -24,7 +26,7 @@ bool importImageFromDmabuf(VkDevice device, VkPhysicalDevice physDevice,
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
     ici.format = format;
-    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.tiling = VK_IMAGE_TILING_LINEAR;  // Changed from OPTIMAL for compatibility
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     ici.usage = usage;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
